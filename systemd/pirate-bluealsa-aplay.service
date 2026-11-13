@@ -1,0 +1,42 @@
+# Installed by the Pirate Audio Bluetooth add-on (removed by its uninstall.sh).
+# Plays Bluetooth audio into the Pirate Audio DAC through the "Pirate Headphone" volume control.
+# It only opens the DAC while audio is actually arriving, so Mopidy can use it the rest of the time.
+[Unit]
+Description=BlueALSA player for the Pirate Audio DAC
+Documentation=man:bluealsa-aplay(1)
+Requires=pirate-bluealsa.service
+After=pirate-bluealsa.service sound.target
+
+[Service]
+Type=simple
+ExecStart=@APLAY@ --pcm=pirate_out --mixer-device=hw:@CARD@ "--mixer-name=Pirate Headphone" --single-audio
+Restart=on-failure
+RestartSec=2
+CapabilityBoundingSet=
+DeviceAllow=char-alsa rw
+DevicePolicy=closed
+IPAddressDeny=any
+LockPersonality=true
+MemoryDenyWriteExecute=true
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateUsers=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+SystemCallFilter=@system-service
+SystemCallFilter=~@resources @privileged
+UMask=0077
+
+[Install]
+WantedBy=bluetooth.target

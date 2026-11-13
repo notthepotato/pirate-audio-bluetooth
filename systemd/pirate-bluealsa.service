@@ -1,0 +1,40 @@
+# Installed by the Pirate Audio Bluetooth add-on (removed by its uninstall.sh).
+# BlueALSA receiving Bluetooth audio from phones (A2DP sink). Sandboxing follows BlueALSA's own unit.
+[Unit]
+Description=BlueALSA Bluetooth audio receiver (Pirate Audio)
+Documentation=man:bluealsa(8)
+Requires=dbus.service
+After=bluetooth.service dbus.service
+
+[Service]
+Type=dbus
+BusName=org.bluealsa
+ExecStart=@BLUEALSA@ -S -p a2dp-sink
+Restart=on-failure
+CapabilityBoundingSet=
+IPAddressDeny=any
+LockPersonality=true
+MemoryDenyWriteExecute=true
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+PrivateUsers=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_BLUETOOTH
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+SystemCallFilter=@system-service
+SystemCallFilter=~@resources @privileged
+UMask=0077
+
+[Install]
+WantedBy=bluetooth.target

@@ -1,0 +1,14 @@
+[Unit]
+Description=Pirate Audio music upload page (drag and drop songs into ~/Music)
+Documentation=file://%h/.local/share/pirate-bluetooth/README.md
+
+[Service]
+Type=simple
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=%h/.local/share/pirate-bluetooth
+ExecStart=/usr/bin/python3 -m pirate_bluetooth.upload
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

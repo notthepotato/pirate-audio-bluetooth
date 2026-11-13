@@ -1,0 +1,3 @@
+#!/bin/sh
+# Pirate Audio Bluetooth add-on command line (see: pirate-bluetooth --help)
+PYTHONPATH="@APP_DIR@" exec /usr/bin/python3 -m pirate_bluetooth.cli "$@"

@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Add music · Pirate Audio</title>
+<style>
+  :root {
+    --bg: #0b0d12; --panel: #141821; --panel-2: #1b202b; --line: #2a3140;
+    --text: #f2f4f8; --muted: #9aa3b5; --faint: #6b7385;
+    --accent: #6ea5ff; --accent-2: #8fbaff; --on-accent: #08111f; --ok: #6ee6aa; --warn: #ffd278; --bad: #ff7a7a;
+    --radius: 14px;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f4f6fa; --panel: #ffffff; --panel-2: #eef1f6; --line: #d9dee8;
+      --text: #121620; --muted: #556074; --faint: #8a93a6;
+      --accent: #2f6fe0; --accent-2: #1f5bc4; --on-accent: #ffffff; --ok: #14915a; --warn: #a86a00; --bad: #c83434;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 20px 16px 48px; }
+  header { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
+  header svg { flex: none; }
+  .brand { display: flex; flex-direction: column; margin-right: auto; }
+  .brand b { font-size: 18px; letter-spacing: .2px; }
+  .brand span { color: var(--muted); font-size: 13px; }
+  .pill { background: var(--panel-2); border: 1px solid var(--line); border-radius: 999px;
+    padding: 5px 12px; font-size: 13px; color: var(--muted); white-space: nowrap; }
+  a.pill { color: var(--text); text-decoration: none; }
+  a.pill:hover { border-color: var(--accent); }
+
+  #drop { position: relative; border: 2px dashed var(--line); border-radius: var(--radius);
+    background: var(--panel); padding: 38px 20px 30px; text-align: center; transition: .15s; }
+  #drop.over { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, var(--panel));
+    transform: scale(1.01); }
+  #drop h1 { font-size: 21px; margin: 14px 0 6px; }
+  #drop p { margin: 0 auto 18px; color: var(--muted); max-width: 440px; }
+  .buttons { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+  button, .btn { font: inherit; font-weight: 600; border-radius: 10px; padding: 9px 16px; cursor: pointer;
+    border: 1px solid var(--line); background: var(--panel-2); color: var(--text); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+  button.primary:hover { background: var(--accent-2); }
+  button:disabled { opacity: .5; cursor: default; }
+  button.link { background: none; border: none; color: var(--accent); padding: 4px 6px; font-weight: 600; }
+  input[type=file] { display: none; }
+
+  section.card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+    margin-top: 16px; padding: 16px; }
+  .card h2 { font-size: 15px; margin: 0 0 10px; display: flex; align-items: center; gap: 8px; }
+  .card h2 .grow { flex: 1; }
+  .bar { height: 6px; border-radius: 3px; background: var(--panel-2); overflow: hidden; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  .bar.ok > i { background: var(--ok); }
+  #summary { color: var(--muted); font-size: 13px; margin: 8px 0 4px; min-height: 1.4em; }
+  #list { list-style: none; margin: 10px 0 0; padding: 0; max-height: 46vh; overflow: auto; }
+  #list li { display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; padding: 9px 2px;
+    border-top: 1px solid var(--line); }
+  #list li:first-child { border-top: none; }
+  #list li.skipped .name { color: var(--muted); }
+  .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .name small { color: var(--faint); }
+  .st { font-size: 13px; color: var(--muted); text-align: right; white-space: nowrap; }
+  .st.ok { color: var(--ok); } .st.warn { color: var(--warn); } .st.bad { color: var(--bad); }
+  .why { grid-column: 1 / -1; font-size: 12.5px; color: var(--muted); }
+  #list .bar { grid-column: 1 / -1; height: 3px; }
+
+  #library { display: flex; align-items: center; gap: 10px; font-size: 14px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--faint); flex: none; }
+  .dot.busy { background: var(--warn); animation: pulse 1s infinite alternate; }
+  .dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); }
+  @keyframes pulse { to { opacity: .35; } }
+  #recent { list-style: none; margin: 8px 0 0; padding: 0; columns: 2 260px; column-gap: 24px; }
+  #recent li { font-size: 13.5px; padding: 3px 0; break-inside: avoid; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+  #recent li b { color: var(--text); font-weight: 500; }
+  .hint { color: var(--faint); font-size: 13px; margin-top: 18px; text-align: center; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <svg width="34" height="34" viewBox="0 0 34 34" aria-hidden="true">
+      <path d="M5 21v-4a12 12 0 0 1 24 0v4" fill="none" stroke="var(--accent)" stroke-width="3" stroke-linecap="round"/>
+      <rect x="3" y="19" width="7" height="11" rx="2.5" fill="var(--accent)"/>
+      <rect x="24" y="19" width="7" height="11" rx="2.5" fill="var(--accent)"/>
+    </svg>
+    <div class="brand"><b>Add music</b><span>Pirate Audio</span></div>
+    <span class="pill" id="free">…</span>
+    <a class="pill" id="iris" href="#" target="_blank" rel="noopener">Open Mopidy ↗</a>
+  </header>
+
+  <div id="drop">
+    <svg width="54" height="54" viewBox="0 0 54 54" aria-hidden="true">
+      <circle cx="27" cy="27" r="26" fill="var(--panel-2)"/>
+      <path d="M27 36V16m0 0-8 8m8-8 8 8" fill="none" stroke="var(--accent)" stroke-width="3.2"
+            stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M17 38h20" stroke="var(--faint)" stroke-width="3" stroke-linecap="round"/>
+    </svg>
+    <h1 id="dropTitle">Drop songs or album folders here</h1>
+    <p id="dropText">MP3, M4A, FLAC, WAV, OGG and more. Album covers and playlists in the folders come along too,
+       and folders keep their Artist/Album layout.</p>
+    <div class="buttons">
+      <button class="primary" id="pickFiles">Choose files</button>
+      <button id="pickFolder">Choose a folder</button>
+    </div>
+    <input type="file" id="files" multiple>
+    <input type="file" id="folder" webkitdirectory multiple>
+  </div>
+
+  <section class="card hidden" id="queueCard" aria-live="polite">
+    <h2><span class="grow" id="queueTitle">Uploading</span>
+      <button class="link hidden" id="retry">Retry failed</button>
+      <button class="link" id="cancel">Cancel</button></h2>
+    <div class="bar" id="totalBar"><i></i></div>
+    <div id="summary"></div>
+    <ul id="list"></ul>
+  </section>
+
+  <section class="card">
+    <h2><span class="grow">Your music on the Pi</span><span class="pill" id="count">…</span></h2>
+    <div id="library"><span class="dot" id="scanDot"></span><span id="scanText">Checking Mopidy's library…</span></div>
+    <ul id="recent"></ul>
+  </section>
+
+  <p class="hint" id="where">Songs are saved in the Music folder on the Pi. In Mopidy, find them under
+    Browse → Local media (or Files).</p>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const CONCURRENCY = 2;
+let info = null;           // /api/status
+let queue = [];            // {file, path, size, row, state, sent}
+let active = new Set();
+let cancelled = false;
+let scanPoll = null;
+
+// ---------- helpers ----------
+function fmtBytes(n) {
+  if (n < 1024) return n + " B";
+  const u = ["KB", "MB", "GB", "TB"]; let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+  return (n >= 100 ? n.toFixed(0) : n.toFixed(1)) + " " + u[i];
+}
+function ext(name) { const m = /\.[^./\\]+$/.exec(name); return m ? m[0].toLowerCase() : ""; }
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+function isJunk(name) { return name.startsWith(".") || /^(thumbs\.db|desktop\.ini)$/i.test(name); }
+
+// ---------- status ----------
+async function refreshStatus() {
+  try {
+    const r = await fetch("/api/status", { cache: "no-store" });
+    if (!r.ok) throw new Error(r.status);
+    info = await r.json();
+  } catch (e) { $("scanText").textContent = "Can't reach the Pi right now."; return null; }
+  $("free").textContent = fmtBytes(Math.max(0, info.free - info.keep_free)) + " free";
+  $("iris").href = `${location.protocol}//${location.hostname}:${info.iris_port}/iris/`;
+  $("count").textContent = info.count.toLocaleString() + (info.count === 1 ? " song" : " songs");
+  $("where").textContent = `Songs are saved in ${info.music_dir} on the Pi. In Mopidy, find them under Browse → Local media (or Files).`;
+  const s = info.scan, dot = $("scanDot");
+  dot.className = "dot" + ({ waiting: " busy", running: " busy", done: " ok", failed: " bad" }[s.state] || "");
+  $("scanText").textContent = {
+    idle: "Mopidy's library refreshes by itself after you add music.",
+    waiting: "New music will be added to Mopidy's library in a moment…",
+    running: "Adding new music to Mopidy's library…",
+    done: "Mopidy's library is up to date.",
+  }[s.state] || s.message || "";
+  const list = $("recent"); list.replaceChildren();
+  for (const r of info.recent) {
+    const parts = r.path.split("/"), li = el("li");
+    li.append(el("b", "", parts.pop()));
+    if (parts.length) li.append(" · " + parts.join(" / "));
+    li.title = r.path; list.append(li);
+  }
+  if (!info.recent.length) list.append(el("li", "", "Nothing here yet - drop some music above."));
+  return info;
+}
+function watchScan() {
+  clearInterval(scanPoll);
+  scanPoll = setInterval(async () => {
+    const s = await refreshStatus();
+    if (s && !["waiting", "running"].includes(s.scan.state)) clearInterval(scanPoll);
+  }, 2000);
+}
+
+// ---------- collecting files (drag and drop, including whole folders) ----------
+function readAllEntries(reader) {
+  return new Promise((resolve) => {
+    const all = [];
+    const next = () => reader.readEntries((batch) => {
+      if (!batch.length) return resolve(all);
+      all.push(...batch); next();
+    }, () => resolve(all));
+    next();
+  });
+}
+async function walk(entry, prefix, out) {
+  if (entry.isFile) {
+    await new Promise((res) => entry.file((f) => { out.push({ file: f, path: prefix + f.name }); res(); }, res));
+  } else if (entry.isDirectory) {
+    for (const child of await readAllEntries(entry.createReader())) await walk(child, prefix + entry.name + "/", out);
+  }
+}
+async function fromDataTransfer(dt) {
+  const out = [], pending = [];
+  // Entries must be taken synchronously, before the drop event finishes.
+  for (const item of Array.from(dt.items || [])) {
+    if (item.kind !== "file") continue;
+    const entry = item.webkitGetAsEntry ? item.webkitGetAsEntry() : null;
+    if (entry) pending.push(entry);
+    else { const f = item.getAsFile(); if (f) out.push({ file: f, path: f.name }); }
+  }
+  if (!pending.length && !out.length) for (const f of Array.from(dt.files || [])) out.push({ file: f, path: f.name });
+  for (const entry of pending) await walk(entry, "", out);
+  return out;
+}
+
+// ---------- queue ----------
+function addFiles(items) {
+  if (!info) return;
+  const audio = new Set(info.audio), extra = new Set(info.extra);
+  const known = new Set(queue.map((q) => q.path));
+  let junk = 0;
+  items.sort((a, b) => a.path.localeCompare(b.path, undefined, { numeric: true }));
+  let budget = info.free - info.keep_free - queue.filter((q) => q.state === "waiting").reduce((s, q) => s + q.size, 0);
+  for (const { file, path } of items) {
+    const name = path.split("/").pop(), e = ext(name);
+    if (isJunk(name) || known.has(path)) { junk++; continue; }
+    const q = { file, path, size: file.size, state: "waiting", sent: 0, why: "" };
+    if (info.refused[e]) { q.state = "refused"; q.why = info.refused[e]; }
+    else if (!audio.has(e) && !extra.has(e)) { junk++; continue; }
+    else if (file.size > info.max_file) { q.state = "refused"; q.why = `Too big (limit ${fmtBytes(info.max_file)}).`; }
+    else if (file.size > budget) { q.state = "refused"; q.why = "Not enough free space on the Pi."; }
+    else budget -= file.size;
+    known.add(path); queue.push(q); drawRow(q);
+  }
+  if (junk) queue.skippedJunk = (queue.skippedJunk || 0) + junk;
+  $("queueCard").classList.remove("hidden");
+  cancelled = false;
+  pump(); updateSummary();
+}
+function drawRow(q) {
+  const li = el("li"), name = el("div", "name"), parts = q.path.split("/");
+  name.append(parts.pop());
+  if (parts.length) { name.append(" "); name.append(el("small", "", parts.join(" / "))); }
+  name.title = q.path;
+  q.stEl = el("div", "st"); q.whyEl = el("div", "why hidden");
+  q.barEl = el("div", "bar hidden"); q.barEl.append(el("i"));
+  li.append(name, q.stEl, q.barEl, q.whyEl);
+  q.row = li; $("list").append(li); paintRow(q);
+}
+function paintRow(q) {
+  const labels = {
+    waiting: [fmtBytes(q.size), ""], uploading: [Math.floor(100 * q.sent / Math.max(1, q.size)) + "%", ""],
+    saved: ["Added", "ok"], exists: ["Already there", "ok"], refused: ["Skipped", "warn"],
+    failed: ["Failed", "bad"], cancelled: ["Cancelled", ""],
+  };
+  const [text, cls] = labels[q.state];
+  q.stEl.textContent = text; q.stEl.className = "st " + cls;
+  q.barEl.classList.toggle("hidden", q.state !== "uploading");
+  q.barEl.firstChild.style.width = (100 * q.sent / Math.max(1, q.size)) + "%";
+  q.whyEl.textContent = q.why || ""; q.whyEl.classList.toggle("hidden", !q.why);
+  q.row && q.row.classList.toggle("skipped", ["refused", "failed", "cancelled"].includes(q.state));
+}
+function pump() {
+  while (!cancelled && active.size < CONCURRENCY) {
+    const q = queue.find((x) => x.state === "waiting");
+    if (!q) break;
+    send(q);
+  }
+  if (!active.size) finished();
+}
+const REFUSED_STATUS = [400, 411, 413, 415, 507];
+async function send(q) {
+  q.state = "uploading"; q.sent = 0; active.add(q); paintRow(q);
+  // Ask first: is it allowed, is there room, is it already on the Pi? (Nothing is sent if not.)
+  try {
+    const r = await fetch(`/api/check?path=${encodeURIComponent(q.path)}&size=${q.size}`, { cache: "no-store" });
+    const c = await r.json();
+    if (!c.ok) { q.state = REFUSED_STATUS.includes(c.status) ? "refused" : "failed"; q.why = c.error; return done(q); }
+    if (c.exists) { q.state = "exists"; q.sent = q.size; return done(q); }
+  } catch (e) { q.state = "failed"; q.why = "Lost the connection to the Pi."; return done(q); }
+  if (cancelled) { q.state = "cancelled"; return done(q); }
+  const xhr = new XMLHttpRequest(); q.xhr = xhr;
+  xhr.open("PUT", "/api/upload?path=" + encodeURIComponent(q.path));
+  xhr.upload.onprogress = (e) => { q.sent = e.loaded; paintRow(q); updateSummary(); };
+  xhr.onload = () => {
+    let body = {}; try { body = JSON.parse(xhr.responseText); } catch (e) {}
+    if (xhr.status === 200) { q.state = body.status === "exists" ? "exists" : "saved"; q.sent = q.size; q.why = ""; }
+    else { q.state = REFUSED_STATUS.includes(xhr.status) ? "refused" : "failed";
+           q.why = body.error || `The Pi answered ${xhr.status}.`; }
+    done(q);
+  };
+  xhr.onerror = () => { q.state = "failed"; q.why = "Lost the connection to the Pi."; done(q); };
+  xhr.onabort = () => { q.state = "cancelled"; done(q); };
+  xhr.send(q.file);
+}
+function done(q) { active.delete(q); q.xhr = null; paintRow(q); updateSummary(); pump(); }
+function updateSummary() {
+  const real = queue.filter((q) => q.state !== "refused");
+  const total = real.reduce((s, q) => s + q.size, 0);
+  const sent = real.reduce((s, q) => s + (["saved", "exists"].includes(q.state) ? q.size : q.sent), 0);
+  const n = (st) => queue.filter((q) => q.state === st).length;
+  const finishedCount = n("saved") + n("exists");
+  const busy = active.size > 0 || n("waiting") > 0;
+  $("totalBar").firstChild.style.width = (total ? 100 * sent / total : 100) + "%";
+  $("totalBar").classList.toggle("ok", !busy && !n("failed"));
+  $("queueTitle").textContent = busy ? "Uploading" : "Upload finished";
+  const bits = [busy ? `${finishedCount} of ${real.length} files · ${fmtBytes(sent)} of ${fmtBytes(total)}`
+                     : `${n("saved")} added` + (n("exists") ? `, ${n("exists")} already on the Pi` : "")];
+  if (n("refused")) bits.push(`${n("refused")} skipped`);
+  if (n("failed")) bits.push(`${n("failed")} failed`);
+  if (n("cancelled")) bits.push(`${n("cancelled")} cancelled`);
+  if (queue.skippedJunk) bits.push(`${queue.skippedJunk} non-music file${queue.skippedJunk === 1 ? "" : "s"} ignored`);
+  $("summary").textContent = bits.join(" · ");
+  $("cancel").classList.toggle("hidden", !busy);
+  $("retry").classList.toggle("hidden", busy || !n("failed"));
+}
+function finished() {
+  updateSummary();
+  if (queue.some((q) => q.state === "saved")) { refreshStatus(); watchScan(); }
+}
+
+// ---------- wiring ----------
+let dragDepth = 0;
+window.addEventListener("dragenter", (e) => { e.preventDefault(); dragDepth++; $("drop").classList.add("over"); });
+window.addEventListener("dragleave", (e) => { if (--dragDepth <= 0) { dragDepth = 0; $("drop").classList.remove("over"); } });
+window.addEventListener("dragover", (e) => { e.preventDefault(); if (e.dataTransfer) e.dataTransfer.dropEffect = "copy"; });
+window.addEventListener("drop", async (e) => {
+  e.preventDefault(); dragDepth = 0; $("drop").classList.remove("over");
+  if (e.dataTransfer) addFiles(await fromDataTransfer(e.dataTransfer));
+});
+$("pickFiles").onclick = () => $("files").click();
+$("pickFolder").onclick = () => $("folder").click();
+for (const id of ["files", "folder"]) {
+  $(id).onchange = (e) => {
+    addFiles(Array.from(e.target.files).map((f) => ({ file: f, path: f.webkitRelativePath || f.name })));
+    e.target.value = "";
+  };
+}
+$("cancel").onclick = () => {
+  cancelled = true;
+  for (const q of queue) if (q.state === "waiting") { q.state = "cancelled"; paintRow(q); }
+  for (const q of Array.from(active)) if (q.xhr) q.xhr.abort();
+  updateSummary();
+};
+$("retry").onclick = () => {
+  for (const q of queue) if (q.state === "failed") { q.state = "waiting"; q.why = ""; paintRow(q); }
+  cancelled = false; pump(); updateSummary();
+};
+window.addEventListener("beforeunload", (e) => {
+  if (active.size || queue.some((q) => q.state === "waiting")) { e.preventDefault(); e.returnValue = ""; }
+});
+// Phones can't drag and drop or pick whole folders: say what works there instead.
+if (/iPhone|iPad|iPod|Android/i.test(navigator.userAgent)) {
+  $("pickFolder").classList.add("hidden");
+  $("dropTitle").textContent = "Add songs from your phone";
+  $("dropText").textContent = "Tap Choose files and pick songs from the Files app (MP3, M4A, FLAC, WAV, OGG and more).";
+}
+
+refreshStatus().then((s) => { if (s && ["waiting", "running"].includes(s.scan.state)) watchScan(); });
+</script>
+</body>
+</html>

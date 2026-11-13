@@ -1,0 +1,159 @@
+# Pirate Audio Bluetooth add-on
+
+Pair your iPhone with your Raspberry Pi like a pair of headphones and listen through the **Pirate Audio's
+headphone jack**. It works with no Wi-Fi or internet at all, so songs you've downloaded in Apple Music play
+anywhere. While your phone plays, the Pirate Audio's screen shows the song, artist and progress, and the four
+buttons control playback.
+
+![Screens](docs/screens.png)
+
+It also adds a **drag-and-drop music upload page**: open `http://raspberrypi.local:6681` on your PC or phone,
+drop songs or whole album folders on it, and they go straight into the Pi's Music folder, ready to play in
+Mopidy.
+
+**Pimoroni's Pirate Audio software keeps working exactly as before.** Mopidy, its screen, its buttons, its web
+page and your music files are all untouched, and so are their settings. While your phone is playing, the add-on
+borrows the screen and buttons. When you stop (or disconnect), it gives them back with Mopidy's queue, track,
+position, shuffle/repeat and volume put back where they were.
+
+## What you need
+
+- A Raspberry Pi with built-in Bluetooth (Zero 2 W, 3, 4 or 5) and a Pimoroni Pirate Audio board
+- **Raspberry Pi OS Lite** (Bookworm or Trixie). The installer stops if it finds a desktop sound system.
+- Pimoroni's Pirate Audio software (optional; the add-on also works on its own)
+
+## Install
+
+Copy this folder onto the Pi (from Windows PowerShell: `scp -r pirate-audio-bluetooth pi@raspberrypi.local:~`), then:
+
+```bash
+cd pirate-audio-bluetooth
+bash install.sh --check   # see exactly what would change - changes nothing
+bash install.sh           # install (it asks first)
+```
+
+Options: `--name "…"`, `--y-pin 20` for early boards, `--upload-port 8090` if port 6681 is taken,
+`--no-upload` to skip the upload page. Running `install.sh` again updates the add-on and keeps your settings.
+
+Everything comes from Raspberry Pi OS packages, so nothing is compiled. The install takes a few minutes.
+
+## Pair your phone (once)
+
+1. The first time, the screen shows **Pairing mode** by itself. After that: hold **A**, then press **X**.
+   Over SSH: `pirate-bluetooth pair`.
+2. On the iPhone, go to **Settings → Bluetooth** and tap **Pirate Audio**.
+3. Both screens show the same 6-digit code. Press **A** on the Pirate Audio and tap **Pair** on the iPhone.
+
+After that it works like headphones. Pick **Pirate Audio** in Control Center (or the iPhone reconnects by itself),
+plug your headphones into the Pirate Audio, and play.
+
+## Add music from your PC or phone
+
+![Upload page](docs/upload-page.png)
+
+Open **`http://raspberrypi.local:6681`** in a browser on the same Wi-Fi. Use your Pi's name if it isn't
+`raspberrypi`. The exact address is also on the Pirate Audio's info screen: hold **A**.
+
+- **On a PC:** drag songs or whole album folders onto the page, or use *Choose files* / *Choose a folder*.
+  Folders keep their Artist/Album layout, and album covers and playlists inside them come along.
+- **On an iPhone:** tap *Choose files* and pick songs from the Files app.
+- **Songs already on the Pi** are recognised and not sent again, so you can re-drop a whole folder after adding
+  a few songs to it.
+- **Copy-protected Apple Music/iTunes files (`.m4p`) and non-music files** are skipped, and the page says why.
+- **When the uploads finish,** Mopidy's library refreshes by itself in the background, with no restart and no
+  interruption. The songs show up in Iris under *Browse → Local media* (or *Files*).
+
+The page only works on your local network. If you use the Pi on shared Wi-Fi (campus, café…), set a password
+under `[upload]` in `settings.ini`, then run `systemctl --user restart pirate-upload`.
+
+## Buttons
+
+| Button | While your phone plays | Hold |
+|---|---|---|
+| **A** (top left) | Play / pause | Info screen (name, phone, paired phones, volume, IP) |
+| **X** (top right) | Next track | Previous track |
+| **B** (bottom left) | Volume down | Keeps going |
+| **Y** (bottom right) | Volume up | Keeps going |
+
+- **Info screen:** **X** pairs a new phone, **A** closes it.
+- **Code screen:** **A** accepts, **B** cancels.
+- **Idle screen:** **A** reconnects your last phone.
+- **When Bluetooth isn't playing:** the buttons and screen belong to Mopidy, exactly as before.
+
+B and Y work like a volume knob on the headphone amp. They're separate from the phone's own volume.
+
+## How it shares with Mopidy
+
+- **Phone starts playing:** Mopidy's queue and settings are saved, Mopidy is paused out of the way, and the
+  screen shows your phone's song.
+- **Phone paused for a minute, or disconnected:** "Back to Mopidy…" appears, Mopidy starts again, and its
+  queue comes back paused at the same spot, without making a sound.
+- **A phone that just connects (without playing) doesn't interrupt Mopidy.** Your iPhone auto-connecting when
+  you walk in won't stop the music.
+- If the add-on ever crashes while Mopidy is paused out of the way, it restarts Mopidy when it comes back.
+
+## Commands
+
+```bash
+pirate-bluetooth                     # status: name, pairing mode, paired phones
+pirate-bluetooth pair                # pairing mode for 3 minutes
+pirate-bluetooth name "Kite's Pirate"
+pirate-bluetooth forget "Kite's iPhone"   # or: forget all
+journalctl --user -u pirate-bluetooth -f  # screen/buttons log
+journalctl -u pirate-bluealsa-aplay -f    # Bluetooth audio log
+journalctl --user -u pirate-upload -f     # upload page log
+```
+
+Settings are in `~/.config/pirate-bluetooth/settings.ini`. They include how long the phone can stay paused
+before Mopidy gets the screen back, the Y-button pin on early boards, screen rotation and the volume step.
+After editing, run `systemctl --user restart pirate-bluetooth`.
+
+## Good to know
+
+- **Apple Music downloads stay on your phone.** The phone plays them and sends the sound over Bluetooth, so
+  offline listening works anywhere.
+- **No album art over Bluetooth:** the screen draws a colored card for each album instead.
+- Bluetooth audio uses a standard Bluetooth codec, so it's slightly lower quality than a wired or AirPlay
+  connection, but fine for headphones.
+- The screen program starts with your user services, the same way Mopidy does. The Bluetooth audio itself runs
+  from power-on.
+
+## Troubleshooting
+
+- **The iPhone doesn't list "Pirate Audio".** It only appears in pairing mode: hold A, then press X, or run
+  `pirate-bluetooth pair`.
+- **Connected, but no sound.** Press Y a few times (headphone volume) and check the phone's volume. Then check
+  `systemctl status pirate-bluealsa pirate-bluealsa-aplay`.
+- **Y does nothing.** Boards made before 23 January 2020 use BCM 20. Set `y_pin = 20` in `settings.ini`.
+- **Picture upside down.** Set `rotation = 270` in `settings.ini`.
+- **The upload page doesn't open.** Check that your PC or phone is on the same Wi-Fi as the Pi, and try the IP
+  address from the info screen instead of `raspberrypi.local`. Then check `systemctl --user status pirate-upload`.
+  Some campus and public networks block devices from reaching each other.
+- **Uploaded songs don't show in Mopidy's Local media.** Look under *Files* (that always works). If Local media
+  stays empty, Mopidy-Local's scan may have failed: `journalctl --user -u pirate-upload` shows why.
+
+## Uninstall
+
+```bash
+bash uninstall.sh           # undoes exactly what install.sh changed (it kept a record)
+bash uninstall.sh --purge   # also removes settings.ini and the extra packages it installed
+```
+
+## What gets changed
+
+| What | Where | Undone by uninstall.sh |
+|---|---|---|
+| BlueALSA package (Bluetooth audio) | `bluez-alsa-utils`, only if missing | removed |
+| Bluetooth audio services | `pirate-bluealsa`, `pirate-bluealsa-aplay` | removed |
+| "Pirate Headphone" volume control | a marked block in `/etc/asound.conf` (backed up) | removed |
+| Shows up as headphones on phones | one line in `/etc/bluetooth/main.conf` (backed up) | original line put back |
+| Screen/buttons/pairing program | `~/.local/share/pirate-bluetooth`, user service `pirate-bluetooth` | removed |
+| `pirate-bluetooth` command | `/usr/local/bin` | removed |
+| Music upload page | user service `pirate-upload` (port 6681) | removed; your uploaded music stays |
+| **Not changed** | Mopidy and its config, default sound output, other sound cards, Wi-Fi, how your services start, already-installed packages | |
+
+## Credits
+
+[BlueALSA](https://github.com/arkq/bluez-alsa) and [BlueZ](https://www.bluez.org/) do the Bluetooth work.
+Pimoroni's [Pirate Audio](https://github.com/pimoroni/pirate-audio) software and
+[st7789 library](https://github.com/pimoroni/st7789-python) drive the screen. Each is used under its own license.

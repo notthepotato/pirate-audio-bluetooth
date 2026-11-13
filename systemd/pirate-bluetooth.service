@@ -1,0 +1,14 @@
+[Unit]
+Description=Pirate Audio Bluetooth screen, buttons and pairing
+Documentation=file://%h/.local/share/pirate-bluetooth/README.md
+
+[Service]
+Type=simple
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=%h/.local/share/pirate-bluetooth
+ExecStart=%h/.local/share/pirate-bluetooth/venv/bin/python -m pirate_bluetooth
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
