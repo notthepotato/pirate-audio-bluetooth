@@ -1,4 +1,4 @@
-"""Drag-and-drop music upload page for the Pi (Python standard library only).
+"""Music page for the Pi: drag-and-drop upload, and download back to a computer (standard library only).
 
 Serves a small web page (default http://<pi>:6681) where you can drop songs or whole album folders.
 They are saved into ~/Music - the folder Pimoroni's Mopidy setup already plays from - and Mopidy's
@@ -6,6 +6,9 @@ local library is refreshed in the background afterwards, without restarting or i
 
 Uploads are streamed straight to disk (no size limit in memory), written under a hidden temporary
 name and only renamed into place once complete, so Mopidy never sees half-written files.
+
+The same page browses the Music folder and downloads single songs, or whole folders (or everything) as
+a .zip that's put together while it downloads (stored, not compressed: music files don't shrink).
 """
 
 import argparse
@@ -14,6 +17,7 @@ import configparser
 import hmac
 import json
 import logging
+import mimetypes
 import os
 import re
 import shlex
@@ -23,6 +27,7 @@ import threading
 import time
 import unicodedata
 import urllib.parse
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -202,6 +207,83 @@ class MusicStore:
     def _rel(self, path: Path) -> str:
         return str(path.relative_to(self.root))
 
+    # -- downloads ----------------------------------------------------------------------------------
+    def resolve(self, raw_path: str, folder: bool) -> Path:
+        """A file or folder inside the music folder ("" = the music folder itself), or UploadError 404."""
+        parts = clean_relative_path(raw_path) if raw_path.strip("/ ") else []
+        target = self.root.joinpath(*parts)
+        ok = self._inside_root(target) and (target.is_dir() if folder else target.is_file())
+        if not ok or (not folder and os.path.splitext(target.name)[1].lower() not in AUDIO_EXTS | EXTRA_EXTS):
+            raise UploadError(404, "That isn't on the Pi (any more?).")
+        return target
+
+    def _music_files(self, folder: Path):
+        """(path, size) of the songs, covers and playlists under a folder, in a stable order."""
+        for dirpath, dirnames, filenames in os.walk(folder):
+            dirnames[:] = sorted((d for d in dirnames if not d.startswith(".")), key=_sort_key)
+            for f in sorted(filenames, key=_sort_key):
+                if f.startswith(".") or os.path.splitext(f)[1].lower() not in AUDIO_EXTS | EXTRA_EXTS:
+                    continue
+                p = Path(dirpath) / f
+                try:
+                    if p.is_file() and self._inside_root(p):
+                        yield p, p.stat().st_size
+                except OSError:
+                    pass
+
+    def listing(self, raw_path: str) -> dict:
+        """What's in one folder: its subfolders (with how many songs and how big) and its files."""
+        folder = self.resolve(raw_path, folder=True)
+        folders, files = [], []
+        total_songs = total_bytes = 0
+        try:
+            entries = sorted(os.scandir(folder), key=lambda e: _sort_key(e.name))
+        except OSError as err:
+            raise UploadError(500, f"Couldn't read that folder: {err.strerror or err}")
+        for e in entries:
+            if e.name.startswith("."):
+                continue
+            path = Path(e.path)
+            try:
+                if e.is_dir() and self._inside_root(path):
+                    songs = size = 0
+                    for p, n in self._music_files(path):
+                        size += n
+                        songs += os.path.splitext(p.name)[1].lower() in AUDIO_EXTS
+                    if size:  # folders with no music (or covers/playlists) in them aren't shown
+                        folders.append({"name": e.name, "songs": songs, "size": size})
+                    total_songs, total_bytes = total_songs + songs, total_bytes + size
+                elif e.is_file() and self._inside_root(path):
+                    ext = os.path.splitext(e.name)[1].lower()
+                    if ext in AUDIO_EXTS | EXTRA_EXTS:
+                        size = e.stat().st_size
+                        files.append({"name": e.name, "size": size, "kind": "audio" if ext in AUDIO_EXTS else "extra"})
+                        total_songs, total_bytes = total_songs + (ext in AUDIO_EXTS), total_bytes + size
+            except OSError:
+                continue
+        rel = self._rel(folder)
+        return {"path": "" if rel == "." else rel, "folders": folders, "files": files,
+                "songs": total_songs, "size": total_bytes}
+
+    def write_zip(self, folder: Path, out) -> int:
+        """Write a .zip of a folder to out (a socket: written as it goes, never all in memory)."""
+        top = folder.name or "Music"
+        count = 0
+        with zipfile.ZipFile(_Unseekable(out), "w", zipfile.ZIP_STORED, allowZip64=True) as zf:
+            for path, _size in self._music_files(folder):
+                arcname = "/".join((top, *path.relative_to(folder).parts))
+                try:
+                    info = zipfile.ZipInfo.from_file(path, arcname, strict_timestamps=False)
+                    src = open(path, "rb")
+                except OSError as err:
+                    log.warning("Leaving %s out of the zip: %s", path, err.strerror or err)
+                    continue
+                info.compress_type = zipfile.ZIP_STORED
+                with src, zf.open(info, "w") as dest:
+                    shutil.copyfileobj(src, dest, CHUNK)
+                count += 1
+        return count
+
     def recent(self, limit=12):
         """The newest music files (cached for a few seconds; walking a big library on a Pi Zero isn't free)."""
         at, cached = self._recent_cache
@@ -224,6 +306,57 @@ class MusicStore:
                   "recent": [{"path": self._rel(p), "added": int(m)} for m, p in found[:limit]]}
         self._recent_cache = (time.monotonic(), result)
         return result
+
+
+def _sort_key(name: str):
+    """Natural order: "2 Song" before "10 Song", ignoring case."""
+    return [(0, int(t), "") if t.isdigit() else (1, 0, t) for t in re.split(r"(\d+)", name.casefold()) if t]
+
+
+class _Unseekable:
+    """A socket as zipfile sees it: written in order, no seeking (it then adds sizes after each file)."""
+
+    def __init__(self, out):
+        self.out = out
+
+    def write(self, data):
+        self.out.write(data)
+        return len(data)
+
+    def flush(self):
+        pass
+
+
+class _Chunked:
+    """HTTP/1.1 chunked body. If the download breaks off, the last chunk is never sent, so the browser
+    reports a failed download instead of keeping a cut-off .zip."""
+
+    def __init__(self, out, size=256 * 1024):
+        self.out, self.size, self.buf = out, size, bytearray()
+
+    def write(self, data):
+        self.buf += data
+        if len(self.buf) >= self.size:
+            self._send()
+
+    def flush(self):
+        pass
+
+    def _send(self):
+        if self.buf:
+            self.out.write(b"%X\r\n" % len(self.buf) + bytes(self.buf) + b"\r\n")
+            self.buf.clear()
+
+    def finish(self):
+        self._send()
+        self.out.write(b"0\r\n\r\n")
+
+
+def content_disposition(name: str) -> str:
+    """attachment; with a plain-ASCII fallback name for old browsers and the real (UTF-8) name for the rest."""
+    plain = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
+    plain = re.sub(r'[^A-Za-z0-9 ._()\-]', "_", plain).strip() or "download"
+    return f"attachment; filename=\"{plain}\"; filename*=UTF-8''{urllib.parse.quote(name, safe='')}"
 
 
 # ==== refreshing Mopidy's library ===================================================================
@@ -402,6 +535,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"ok": False, "status": err.status, "error": err.message})
             except ValueError:
                 self._send(200, {"ok": False, "status": 400, "error": "Bad size."})
+        elif path in ("/api/browse", "/api/download", "/api/zip"):
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            raw_path = (query.get("path") or [""])[0]
+            if path == "/api/browse":
+                try:
+                    self._send(200, self.store.listing(raw_path))
+                except UploadError as err:
+                    self._send(err.status, {"error": err.message})
+            elif path == "/api/download":
+                self._send_file(raw_path)
+            else:
+                self._send_zip(raw_path)
         elif path == "/api/status":
             library = self.store.recent()
             self._send(200, {
@@ -419,6 +564,84 @@ class Handler(BaseHTTPRequestHandler):
             })
         else:
             self._send(404, {"error": "Not found"})
+
+    # -- downloads --
+    def _send_file(self, raw_path):
+        try:
+            target = self.store.resolve(raw_path, folder=False)
+            fh = open(target, "rb")
+            size = os.fstat(fh.fileno()).st_size
+        except UploadError as err:
+            return self._send(err.status, {"error": err.message})
+        except OSError as err:
+            return self._send(500, {"error": f"Couldn't read the file: {err.strerror or err}"})
+        with fh:
+            start, end, status = 0, size - 1, 200
+            m = re.fullmatch(r"bytes=(\d*)-(\d*)", self.headers.get("Range", "").strip())
+            if m and (m.group(1) or m.group(2)):  # a download picking up where it stopped
+                if m.group(1):
+                    start = int(m.group(1))
+                    end = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
+                else:
+                    start = max(0, size - int(m.group(2)))
+                if start > end:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                status = 206
+            length = max(0, end - start + 1)
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", mimetypes.guess_type(target.name)[0] or "application/octet-stream")
+                self.send_header("Content-Length", str(length))
+                self.send_header("Content-Disposition", content_disposition(target.name))
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                if status == 206:
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                self.end_headers()
+                fh.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = fh.read(min(CHUNK, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+            except (BrokenPipeError, ConnectionResetError, TimeoutError):
+                log.info("%s stopped downloading %s", self.address_string(), target.name)
+                self.close_connection = True
+                return
+        log.info("Sent %s to %s", self.store._rel(target), self.address_string())
+
+    def _send_zip(self, raw_path):
+        try:
+            folder = self.store.resolve(raw_path, folder=True)
+        except UploadError as err:
+            return self._send(err.status, {"error": err.message})
+        name = (folder.name if raw_path.strip("/ ") else "Music") + ".zip"
+        self.protocol_version = "HTTP/1.1"  # for a chunked reply (see _Chunked)
+        self.close_connection = True
+        body = _Chunked(self.wfile)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Disposition", content_disposition(name))
+            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            count = self.store.write_zip(folder, body)
+            body.finish()
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            log.info("%s stopped downloading %s", self.address_string(), name)
+            return
+        except (OSError, ValueError, zipfile.LargeZipFile) as err:
+            log.warning("Making %s failed: %s", name, err)  # the reply just stops: the browser says it failed
+            return
+        log.info("Sent %s (%d files) to %s", name, count, self.address_string())
 
     def do_PUT(self):
         if not self._authorized():

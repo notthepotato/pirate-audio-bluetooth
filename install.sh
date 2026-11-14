@@ -1,7 +1,11 @@
 #!/bin/bash
 # Pirate Audio Bluetooth add-on: pair your phone with the Pi like a pair of headphones and listen
 # through the Pirate Audio's headphone jack, with now-playing info on its screen and the four buttons
-# as controls. Made to sit next to Pimoroni's own Pirate Audio software (Mopidy) without changing it.
+# as controls, plus a music menu for the Pi's own music (Mopidy) and a web page to add/download music.
+#
+# One script for everything: on a fresh Raspberry Pi OS Lite (Bookworm or Trixie) it also sets up the
+# Pi's music player (Mopidy, its library and the Iris web page). On a Pi that already has Pimoroni's
+# Pirate Audio software, it uses that.
 #
 #   bash install.sh --check     look at the system and say what would change, without changing anything
 #   bash install.sh             install (asks before changing anything)
@@ -26,6 +30,12 @@ BIN_DIR="$ROOT/usr/local/bin"
 DATESTAMP="$(date "+%Y-%m-%d-%H-%M-%S")"
 CLASS_MARK="# pirate-bluetooth: show up as headphones in phones' Bluetooth lists (uninstall.sh restores the line below)"
 CLASS_LINE="Class = 0x000418"
+EXP_MARK="# pirate-bluetooth: lets phones send album art over Bluetooth (uninstall.sh removes the line below)"
+EXP_LINE="Experimental = true"
+# The Pi's music player for fresh installs: the versions Pimoroni's installer used, which still work with
+# the Iris web page (Iris doesn't support Mopidy 4 yet). setuptools<81 keeps pkg_resources, which they use.
+MOPIDY_PIP=("Mopidy==3.4.2" "Mopidy-Local==3.3.0" "Mopidy-Iris==3.70.0" "setuptools<81")
+MOPIDY_VENV="$HOME/.virtualenvs/mopidy"
 
 NAME="Pirate Audio"
 Y_PIN=24
@@ -33,6 +43,8 @@ UPLOAD=true
 UPLOAD_PORT=6681
 LATENCY=""  # empty: keep the current setting (or "normal" on a first install)
 KEEP_PIMORONI_SCREEN=false
+WANT_MOPIDY=true
+PHONE_ART=true
 ASSUME_YES=false
 CHECK_ONLY=false
 REBOOT_NEEDED=false
@@ -51,13 +63,16 @@ Usage: bash install.sh [options]
   --check          Look at this Pi and list what the install would change. Changes nothing.
   --name "NAME"    Name phones see in their Bluetooth list (default: "Pirate Audio").
   --y-pin 20       Use BCM 20 for the Y button (Pirate Audio boards made before 23 Jan 2020).
-  --upload-port N  Port for the music upload page (default 6681).
-  --no-upload      Don't install the music upload page.
+  --upload-port N  Port for the music page (upload and download; default 6681).
+  --no-upload      Don't install the music page.
   --latency LEVEL  How far the sound lags behind the phone: low (~0.1 s buffered on the Pi),
                    normal (~0.2 s, default) or safe (~0.5 s, BlueALSA's own default).
   --keep-pimoroni-screen
                    Leave Pimoroni's now-playing screen and buttons to Mopidy, and only borrow them while
                    the phone plays (the add-on's older way; no music menu on the device).
+  --no-mopidy      On a Pi without Mopidy: don't install it (Bluetooth only, no music stored on the Pi).
+  --no-phone-art   Don't set up album art from the phone over Bluetooth (Trixie). The online lookup
+                   (settings.ini, art_lookup) is separate.
   -y, --yes        Don't ask for confirmation.
   -h, --help       Show this help.
 EOF
@@ -74,6 +89,8 @@ while [ $# -gt 0 ]; do
         --latency) shift; LATENCY="${1:-}" ;;
         --latency=*) LATENCY="${1#--latency=}" ;;
         --keep-pimoroni-screen) KEEP_PIMORONI_SCREEN=true ;;
+        --no-mopidy) WANT_MOPIDY=false ;;
+        --no-phone-art) PHONE_ART=false ;;
         -y|--yes) ASSUME_YES=true ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; fatal "Unknown option: $1" ;;
@@ -86,6 +103,14 @@ done
 record() { mkdir -p "$CONF_DIR"; printf '%s=%q\n' "$1" "$2" >> "$RECORD"; }
 record_add() { mkdir -p "$CONF_DIR"; printf '%s+=%q\n' "$1" " $2" >> "$RECORD"; }
 installed() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed"; }
+version_ge() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$2" ]; }  # is $1 >= $2 ?
+# The BlueZ version that is (or would be) installed, e.g. "5.82"
+bluez_version() {
+    local v
+    v="$(dpkg-query -W -f='${Version}' bluez 2>/dev/null || true)"
+    [ -n "$v" ] || v="$(apt-cache policy bluez 2>/dev/null | awk '/Candidate:/ {print $2}')"
+    echo "$v" | grep -oE '^[0-9]+\.[0-9]+' || true
+}
 # Playback buffer for bluealsa-aplay (microseconds). It starts playing once the buffer is full, so the
 # buffer size is the delay added on the Pi. Smaller = less lag, but more chance of crackles when the
 # radio is busy (e.g. big Wi-Fi transfers). Keep in step with LATENCY_LEVELS in pirate_bluetooth/cli.py.
@@ -117,6 +142,12 @@ systemctl --user show-environment >/dev/null 2>&1 \
 MODEL="$(tr -d '\0' < "$ROOT/proc/device-tree/model" 2>/dev/null || echo "unknown")"
 CODENAME="$(. "$ROOT/etc/os-release" && echo "${VERSION_CODENAME:-unknown}")"
 case "$CODENAME" in bookworm|trixie) ;; *) NOTES+=("Tested on Raspberry Pi OS Bookworm and Trixie; this is '$CODENAME'.") ;; esac
+BLUEZ_VER="$(bluez_version)"
+# Phones can send album art over Bluetooth (AVRCP cover art) to BlueZ 5.79 and newer - Trixie, not Bookworm.
+BT_ART=false
+if $PHONE_ART && [ -n "$BLUEZ_VER" ] && version_ge "$BLUEZ_VER" "5.79"; then
+    BT_ART=true
+fi
 
 if [ -f "$ROOT/boot/firmware/config.txt" ]; then CONFIG_TXT="$ROOT/boot/firmware/config.txt"
 elif [ -f "$ROOT/boot/config.txt" ]; then CONFIG_TXT="$ROOT/boot/config.txt"
@@ -176,6 +207,24 @@ fi
 # Packages: only install what's missing, never upgrade what's there
 WANTED=(bluez bluez-alsa-utils alsa-utils curl python3-venv python3-pip python3-dev python3-pil python3-numpy
         python3-spidev python3-gi python3-gpiozero python3-lgpio fonts-dejavu-core)
+# Pimoroni's Mopidy setup, or a fresh install of it?
+MOPIDY=false
+systemctl --user cat mopidy >/dev/null 2>&1 && MOPIDY=true
+INSTALL_MOPIDY=false
+if ! $MOPIDY && $WANT_MOPIDY; then
+    INSTALL_MOPIDY=true
+    WANTED+=(python3-gst-1.0 gir1.2-gstreamer-1.0 gstreamer1.0-plugins-base gstreamer1.0-plugins-good
+             gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-alsa
+             gstreamer1.0-tools python3-setuptools python3-requests python3-tornado)
+    TRIXIE_FIX=""
+    [ "$CODENAME" = trixie ] && TRIXIE_FIX=", plus the fix Mopidy 3.4 needs on Trixie"
+    CHANGES+=("install the Pi's music player: Mopidy 3.4.2, its music library (Mopidy-Local 3.3.0) and the Iris
+      web page (port 6680), in $MOPIDY_VENV as user service 'mopidy' - the same layout as Pimoroni's
+      installer$TRIXIE_FIX. Music goes in ~/Music")
+fi
+if $BT_ART; then
+    WANTED+=(bluez-obexd dbus-user-session)
+fi
 MISSING=()
 for pkg in "${WANTED[@]}"; do installed "$pkg" || MISSING+=("$pkg"); done
 [ ${#MISSING[@]} -gt 0 ] && CHANGES+=("install packages: ${MISSING[*]}")
@@ -193,10 +242,24 @@ else
     CHANGES+=("set the Bluetooth device class to 'headphones' in $MAIN_CONF (backed up; restores on uninstall)")
 fi
 
+# BlueZ's experimental features (needed for album art over Bluetooth)
+EXP_ACTION="none"
+if $BT_ART && [ -f "$MAIN_CONF" ]; then
+    if grep -qF "$EXP_MARK" "$MAIN_CONF" || grep -qiE '^[[:space:]]*Experimental[[:space:]]*=[[:space:]]*true' "$MAIN_CONF"; then
+        EXP_ACTION="already"
+    elif grep -qE '^[[:space:]]*Experimental[[:space:]]*=' "$MAIN_CONF"; then
+        BT_ART=false
+        NOTES+=("$MAIN_CONF switches BlueZ's experimental features off on purpose, so album art comes from the
+      online lookup instead of over Bluetooth.")
+    else
+        EXP_ACTION="set"
+        CHANGES+=("switch on BlueZ's experimental features in $MAIN_CONF, needed for album art from your phone over
+      Bluetooth (backed up; uninstall.sh removes the line)")
+    fi
+fi
+
 # Pimoroni's Mopidy setup
-MOPIDY=false
-if systemctl --user cat mopidy >/dev/null 2>&1; then
-    MOPIDY=true
+if $MOPIDY; then
     MOPIDY_PORT="$(awk -F'=' '/^\[/{s=($0=="[http]")} s && $1 ~ /^[[:space:]]*port[[:space:]]*$/ {gsub(/[[:space:]]/,"",$2); print $2}' \
         "$HOME/.config/mopidy/mopidy.conf" 2>/dev/null | tail -n1)"
     MOPIDY_PORT="${MOPIDY_PORT:-6680}"
@@ -246,9 +309,10 @@ fi
 if $MOPIDY && ! $KEEP_PIMORONI_SCREEN; then
     MOPIDY_CONF_FILE="$(PYTHONPATH="$SCRIPT_DIR" python3 -c 'from pirate_bluetooth import mopidyconf; print(mopidyconf.config_files()[-1])' 2>/dev/null || true)"
     if [ -n "$MOPIDY_CONF_FILE" ] && [ -f "$MOPIDY_CONF_FILE" ]; then
-        for ext in pidi raspberry-gpio; do
-            [ "$(mopidy_conf get "$ext" enabled 2>/dev/null | tr 'A-Z' 'a-z')" = "false" ] || SCREEN_EXTS_ON+=("$ext")
-        done
+        # PiDi / raspberry-gpio that are switched on and installed
+        while IFS= read -r ext; do
+            [ -n "$ext" ] && SCREEN_EXTS_ON+=("$ext")
+        done < <(mopidy_conf own-screen 2>/dev/null || true)
         if [ ${#SCREEN_EXTS_ON[@]} -gt 0 ]; then
             CHANGES+=("switch off Mopidy's own screen and button extensions (${SCREEN_EXTS_ON[*]}) in $MOPIDY_CONF_FILE,
       so the add-on can run the screen and buttons for both the phone and the Pi's music (with a music menu).
@@ -290,31 +354,49 @@ s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(("0.0.0.0", int(sys.argv[1])))  # fails if another program already listens on the port
 PY
     then
-        PROBLEMS+=("Port $UPLOAD_PORT is already used by another program. Pick another one for the upload page,
+        PROBLEMS+=("Port $UPLOAD_PORT is already used by another program. Pick another one for the music page,
       e.g. bash install.sh --upload-port 8090 (or skip it with --no-upload).")
     fi
-    CHANGES+=("add a drag-and-drop music upload page on port $UPLOAD_PORT (user service 'pirate-upload';
-      saves into ~/Music, where Mopidy already looks, and refreshes Mopidy's library)")
+    CHANGES+=("add a music page on port $UPLOAD_PORT (user service 'pirate-upload'): drag and drop songs into
+      ~/Music, where Mopidy already looks (it refreshes Mopidy's library), and download them back to a computer")
 fi
 
 # ---- report ------------------------------------------------------------------------------------------
 echo
 success "Pirate Audio Bluetooth add-on"
-echo "  Pi:            $MODEL ($CODENAME)"
+echo "  Pi:            $MODEL"
+echo "  System:        Raspberry Pi OS ${CODENAME^}, BlueZ ${BLUEZ_VER:-unknown}"
 echo "  Name:          $NAME"
 echo "  Sound card:    $CARD"
-if $MOPIDY && ! $KEEP_PIMORONI_SCREEN && [ -n "$MOPIDY_CONF_FILE" ] && [ -f "$MOPIDY_CONF_FILE" ]; then
+if $BT_ART; then
+    echo "  Album art:     from your phone over Bluetooth, else looked up online"
+elif ! $PHONE_ART; then
+    echo "  Album art:     looked up online by artist and album (--no-phone-art)"
+elif [ "$EXP_ACTION" = "none" ] && [ -n "$BLUEZ_VER" ] && version_ge "$BLUEZ_VER" "5.79"; then
+    echo "  Album art:     looked up online by artist and album (see Notes)"
+else
+    echo "  Album art:     looked up online by artist and album (album art over Bluetooth needs BlueZ 5.79+, i.e. Trixie)"
+fi
+if $INSTALL_MOPIDY; then
+    echo "  Mopidy:        not installed yet - the installer sets it up (with Iris), and the add-on runs the"
+    echo "                 screen and buttons for both your phone and the Pi's music, with a music menu."
+elif ! $MOPIDY && ! $WANT_MOPIDY; then
+    echo "  Mopidy:        not installed, and --no-mopidy: Bluetooth only."
+elif $MOPIDY && ! $KEEP_PIMORONI_SCREEN && [ -n "$MOPIDY_CONF_FILE" ] && [ -f "$MOPIDY_CONF_FILE" ]; then
     echo "  Mopidy:        found - keeps running. The add-on runs the screen and buttons for both your phone"
     echo "                 and the Pi's music, with a music menu (hold A)."
 elif $MOPIDY; then
     echo "  Mopidy:        found - keeps its own screen. While your phone plays, the add-on borrows the"
     echo "                 screen and buttons, then gives them back with Mopidy's queue restored."
-else
-    echo "  Mopidy:        not installed - the add-on keeps the screen and buttons."
 fi
 echo
-echo "Not changed: Mopidy's music, queue and other settings, the default sound output, other sound cards,"
-echo "             your Wi-Fi, and anything already installed (no upgrades)."
+if $INSTALL_MOPIDY; then
+    echo "Not changed: the default sound output, other sound cards, your Wi-Fi, and anything already"
+    echo "             installed (no upgrades)."
+else
+    echo "Not changed: Mopidy's music, queue and other settings, the default sound output, other sound cards,"
+    echo "             your Wi-Fi, and anything already installed (no upgrades)."
+fi
 echo
 echo "Will change:"
 for item in "${CHANGES[@]}"; do echo "  - $item"; done
@@ -371,10 +453,37 @@ if [ ${#MISSING[@]} -gt 0 ]; then
     if [ ${#AVAILABLE[@]} -gt 0 ]; then
         sudo apt-get install -y --no-install-recommends --no-upgrade "${AVAILABLE[@]}"
         for pkg in "${AVAILABLE[@]}"; do installed "$pkg" && record_add NEW_PACKAGES "$pkg"; done
+        # The per-user message bus (for album art over Bluetooth) only starts with a fresh login
+        for pkg in "${AVAILABLE[@]}"; do [ "$pkg" = dbus-user-session ] && REBOOT_NEEDED=true; done
     fi
 else
     inform "Everything needed is already installed"
 fi
+if $INSTALL_MOPIDY; then
+    step "Music player (Mopidy, Mopidy-Local, Iris)"
+    mkdir -p "$HOME/.virtualenvs" "$HOME/Music/Playlists" "$HOME/.config/mopidy" "$USER_UNIT_DIR"
+    [ -x "$MOPIDY_VENV/bin/python" ] || python3 -m venv --system-site-packages "$MOPIDY_VENV"
+    "$MOPIDY_VENV/bin/pip" install --upgrade "${MOPIDY_PIP[@]}" \
+        || fatal "Couldn't install Mopidy with pip (is the Pi online?). Run install.sh again to retry."
+    PYTHONPATH="$SCRIPT_DIR" "$MOPIDY_VENV/bin/python" -m pirate_bluetooth.mopidyfix \
+        || warning "Couldn't apply the Trixie fix to Mopidy's scanner; scanning odd files may fail"
+    "$MOPIDY_VENV/bin/mopidy" --version >/dev/null || fatal "Mopidy didn't install properly."
+    if [ -f "$HOME/.config/mopidy/mopidy.conf" ]; then
+        inform "Keeping your existing ~/.config/mopidy/mopidy.conf"
+    else
+        sed -e "s#@MUSIC_DIR@#$HOME/Music#g" -e "s#@CARD@#$CARD#g" "$SCRIPT_DIR/config/mopidy.conf" \
+            > "$HOME/.config/mopidy/mopidy.conf"
+        record MOPIDY_CONF_CREATED yes
+    fi
+    sed "s#@HOME@#$HOME#g" "$SCRIPT_DIR/systemd/mopidy.service" > "$USER_UNIT_DIR/mopidy.service"
+    systemctl --user daemon-reload
+    systemctl --user enable mopidy
+    record MOPIDY_INSTALLED_BY_US yes
+    MOPIDY=true
+    MOPIDY_PORT=6680
+    $REBOOT_NEEDED || systemctl --user restart mopidy
+fi
+
 BLUEALSA_BIN="$(command -v bluealsa || command -v bluealsad || true)"
 APLAY_BIN="$(command -v bluealsa-aplay || true)"
 [ -n "$BLUEALSA_BIN" ] && [ -n "$APLAY_BIN" ] || fatal "BlueALSA didn't install properly (bluealsa / bluealsa-aplay not found)."
@@ -403,6 +512,15 @@ if [ "$CLASS_ACTION" = "set" ]; then
     rm -f "$TMP"
     record CLASS_ORIG_LINE "$ORIG_LINE"
     record CLASS_CHANGED yes
+fi
+if [ "$EXP_ACTION" = "set" ]; then
+    [ "$CLASS_ACTION" = "set" ] || sudo cp "$MAIN_CONF" "$MAIN_CONF.backup-$DATESTAMP"
+    TMP="$(mktemp)"
+    awk -v mark="$EXP_MARK" -v line="$EXP_LINE" \
+        '{print} !done && $0 ~ /^\[General\]/ {print mark; print line; done = 1}' "$MAIN_CONF" > "$TMP"
+    sudo install -m 0644 "$TMP" "$MAIN_CONF"
+    rm -f "$TMP"
+    record EXP_CHANGED yes
 fi
 # Package-provided BlueALSA units (if any) would compete with ours for the same D-Bus name.
 for unit in bluealsa.service bluealsa-aplay.service; do
@@ -536,7 +654,7 @@ echo "After that it works like headphones: it connects to your iPhone by itself 
 echo "(or pick \"$NAME\" in Control Center), and plays anything, including songs downloaded for offline"
 echo "listening. Right after power-on, A plays whatever you used last: your phone or the Pi's own music."
 echo
-if $MOPIDY && [ "$(mopidy_conf get pidi enabled 2>/dev/null | tr 'A-Z' 'a-z')" = "false" ]; then
+if $MOPIDY && [ -z "$(mopidy_conf own-screen 2>/dev/null)" ]; then
     echo "Buttons:  A play/pause (hold: music menu)   X next (hold: previous)   B/Y volume"
     echo "In the menu:  X/Y move   A open/play (hold: add to queue)   B back"
 else
@@ -547,6 +665,11 @@ if $UPLOAD; then
     echo
     echo "Add music from your PC or phone: open http://$(hostname).local:$UPLOAD_PORT"
     [ -n "$PI_IP" ] && echo "  (or http://$PI_IP:$UPLOAD_PORT) and drag songs or whole album folders onto the page."
+    echo "  The same page downloads music from the Pi back to your computer."
+fi
+if $INSTALL_MOPIDY; then
+    echo
+    echo "The Pi's music player: Iris at http://$(hostname).local:6680/iris (add music on the music page)."
 fi
 echo "Useful:  pirate-bluetooth (status)   pirate-bluetooth logs -f   bash uninstall.sh"
 if $REBOOT_NEEDED; then

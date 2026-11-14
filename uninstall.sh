@@ -33,6 +33,8 @@ success() { echo -e "$(c setaf 2)$1$(c sgr0)"; }
 NEW_PACKAGES="" DISABLED_UNITS="" GROUPS_ADDED="" CONFIG_TXT_ADDED=""
 CLASS_CHANGED="" CLASS_ORIG_LINE="" BT_ENABLED_BY_US="" RFKILL_UNBLOCKED="" ASOUND_CREATED=""
 LINGER_ENABLED_BY_US="" MOPIDY_EXTS_DISABLED="" MOPIDY_CONF_FILE=""
+MOPIDY_INSTALLED_BY_US="" MOPIDY_CONF_CREATED="" EXP_CHANGED=""
+EXP_MARK="# pirate-bluetooth: lets phones send album art over Bluetooth (uninstall.sh removes the line below)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -f "$RECORD" ]; then
     # shellcheck disable=SC1090
@@ -60,6 +62,19 @@ if [ -n "$MOPIDY_EXTS_DISABLED" ] && [ -n "$MOPIDY_CONF_FILE" ] && [ -f "$MOPIDY
     fi
     PYTHONPATH="$SCRIPT_DIR" python3 -m pirate_bluetooth.system restart-mopidy 2>/dev/null \
         || systemctl --user restart mopidy 2>/dev/null || true
+fi
+# The music player, if the installer set it up (your music in ~/Music stays)
+if [ "$MOPIDY_INSTALLED_BY_US" = "yes" ]; then
+    inform "Removing the music player the installer set up (Mopidy and Iris); your music stays in ~/Music"
+    systemctl --user disable --now mopidy 2>/dev/null || true
+    rm -f "$HOME/.config/systemd/user/mopidy.service"
+    systemctl --user daemon-reload || true
+    rm -rf "$HOME/.virtualenvs/mopidy"
+    if $PURGE; then
+        [ "$MOPIDY_CONF_CREATED" = "yes" ] && rm -f "$HOME/.config/mopidy/mopidy.conf"
+        rm -rf "$HOME/.local/share/mopidy" "$HOME/.cache/mopidy"
+    fi
+    rm -f "$STATE_DIR/mopidy-handoff.json"
 fi
 # Belt and braces: if a Bluetooth session had Mopidy stopped, make sure it's running again.
 if [ -f "$STATE_DIR/mopidy-handoff.json" ] && systemctl --user is-enabled mopidy >/dev/null 2>&1; then
@@ -94,6 +109,13 @@ if [ -f "$ASOUND_CONF" ]; then
     fi
 fi
 
+if [ -f "$MAIN_CONF" ] && grep -qF "$EXP_MARK" "$MAIN_CONF"; then
+    inform "Switching BlueZ's experimental features back off"
+    TMP="$(mktemp)"
+    awk -v mark="$EXP_MARK" 'skip { skip = 0; next } $0 == mark { skip = 1; next } { print }' "$MAIN_CONF" > "$TMP"
+    sudo install -m 0644 "$TMP" "$MAIN_CONF"
+    rm -f "$TMP"
+fi
 if [ -f "$MAIN_CONF" ] && grep -qF "$CLASS_MARK" "$MAIN_CONF"; then
     inform "Putting $MAIN_CONF back"
     TMP="$(mktemp)"

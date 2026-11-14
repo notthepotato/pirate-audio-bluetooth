@@ -61,7 +61,9 @@ class BluetoothClient:
       Device    str    name of the connected phone, or None
       Player    bool   the phone exposes media controls
       Status    str    "playing" | "paused" | "stopped" | ...
-      Track     dict   Title, Artist, Album, Duration (ms)
+      Track     dict   Title, Artist, Album, Duration (ms); ImgHandle once a cover art session is up
+      Address   str    the connected phone's Bluetooth address, or None
+      ObexPort  int    where the phone offers album art over Bluetooth (BlueZ 5.79+), or None
       Position  int    ms into the track (sent whenever Track/Status change, too)
       Pairing   bool   pairing mode on/off
       Alias     str    the name phones see
@@ -284,6 +286,8 @@ class BluetoothClient:
         return {
             "_present": bool(self.present and adapter),
             "Device": self._device_name(device) if device else None,
+            "Address": self.objects.get(device, {}).get(IFACE_DEVICE, {}).get("Address") if device else None,
+            "ObexPort": pprops.get("ObexPort") or None,
             "Player": bool(player),
             "Status": pprops.get("Status", ""),
             "Track": dict(pprops.get("Track", {})),

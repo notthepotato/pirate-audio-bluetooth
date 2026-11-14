@@ -1,3 +1,3 @@
 """Bluetooth receiver add-on for Pimoroni Pirate Audio: now-playing screen, pairing and buttons."""
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

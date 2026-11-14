@@ -71,6 +71,36 @@ def upload_port():
     return cfg.getint("upload", "port", fallback=6681)
 
 
+def phone_art_status():
+    """How the phone's album art gets to the screen, in a few words."""
+    cfg = configparser.ConfigParser()
+    cfg.read(SETTINGS)
+    online = cfg.getboolean("bluetooth", "art_lookup", fallback=True)
+    over_bt = cfg.getboolean("bluetooth", "phone_art", fallback=True)
+    fallback = "looked up online" if online else "none (art_lookup = no)"
+    if not over_bt:
+        return f"{fallback} (phone_art = no)"
+    try:
+        res = subprocess.run(["dpkg-query", "-W", "-f=${Version}", "bluez"], capture_output=True, text=True)
+        version = res.stdout.strip()
+    except OSError:
+        version = ""
+    m = re.match(r"(\d+)\.(\d+)", version)
+    if not m or (int(m.group(1)), int(m.group(2))) < (5, 79):
+        why = f"BlueZ {m.group(0)} is too old to get it from the phone" if m else "BlueZ version unknown"
+        return f"{fallback} ({why}; Trixie can)"
+    main = configparser.ConfigParser(strict=False, interpolation=None)
+    try:
+        main.read("/etc/bluetooth/main.conf")
+    except configparser.Error:
+        pass
+    if main.get("General", "Experimental", fallback="false").strip().lower() != "true":
+        return f"{fallback} (to get it from the phone: sudo ./install.sh switches on BlueZ's Experimental)"
+    if not os.path.exists("/usr/share/dbus-1/services/org.bluez.obex.service"):
+        return f"{fallback} (to get it from the phone: sudo apt install bluez-obexd)"
+    return f"sent by the phone over Bluetooth when it offers it, else {fallback}"
+
+
 def current_latency():
     try:
         with open(LATENCY_FILE, encoding="utf-8") as fh:
@@ -202,10 +232,11 @@ def cmd_status(bz, _args):
         print(f"{label} {name_of(dev)} ({state})")
     level = current_latency()
     print(f"{'Bluetooth delay:':<17}{level} ({LATENCY_LEVELS[level][2]})")
+    print(f"{'Phone album art:':<17}{phone_art_status()}")
     argv = _mopidy_execstart()
     if argv:
         files = mopidy_config_files(argv)
-        own = [e for e in ("pidi", "raspberry-gpio") if mopidyconf.extension_enabled(files, e) is not False]
+        own = mopidyconf.runs_own_screen(argv, files)
         print(f"{'Screen, buttons:':<17}" + ("Mopidy's own; the add-on borrows them while the phone plays" if own
                                              else "the add-on, for the phone and the Pi's music (hold A: menu)"))
         library = mopidy_library_enabled(files)
@@ -218,7 +249,7 @@ def cmd_status(bz, _args):
     state = res.stdout.strip() or "unknown"
     port = upload_port()
     where = f" - http://{socket.gethostname()}.local:{port}" if state == "active" else ""
-    print(f"{'Music upload page:':<23}{state}{where}")
+    print(f"{'Music page:':<23}{state}{where}")
 
 
 def cmd_pair(bz, args):

@@ -9,9 +9,13 @@ between your phone and the Pi's music.
 
 ![Screens](docs/screens.png)
 
-It also adds a **drag-and-drop music upload page**: open `http://raspberrypi.local:6681` on your PC or phone,
-drop songs or whole album folders on it, and they go straight into the Pi's Music folder, ready to play in
-Mopidy.
+It also adds a **music page** for your PC or phone: open `http://raspberrypi.local:6681`, drop songs or whole
+album folders on it, and they go straight into the Pi's Music folder, ready to play in Mopidy. The same page
+lets you **download music from the Pi** back to your computer: single songs, whole folders, or everything.
+
+**One script installs everything**, on Raspberry Pi OS **Trixie** or **Bookworm** (it works out which one it's
+on). On a fresh SD card it also sets up the Pi's music player (Mopidy with the Iris web page), so you don't
+need anything else. On Trixie your iPhone also **sends the album art over Bluetooth** itself.
 
 **Pimoroni's Pirate Audio software keeps working.** Mopidy, its web page (Iris) and your music all stay, and
 Mopidy keeps running the whole time. The one thing the installer changes in Mopidy's settings is switching
@@ -23,8 +27,10 @@ borrows the screen and buttons while your phone plays, without the music menu.
 ## What you need
 
 - A Raspberry Pi with built-in Bluetooth (Zero 2 W, 3, 4 or 5) and a Pimoroni Pirate Audio board
-- **Raspberry Pi OS Lite** (Bookworm or Trixie). The installer stops if it finds a desktop sound system.
-- Pimoroni's Pirate Audio software (optional; the add-on also works on its own)
+- **Raspberry Pi OS Lite**, Trixie (recommended: album art straight from your phone) or Bookworm. The
+  installer stops if it finds a desktop sound system.
+- Internet on the Pi while installing. Pimoroni's Pirate Audio software isn't needed: if Mopidy isn't
+  there, the installer sets it up. If it is (Pimoroni's installer on Bookworm), it's kept as it is.
 
 ## Install
 
@@ -36,11 +42,39 @@ bash install.sh --check   # see exactly what would change - changes nothing
 bash install.sh           # install (it asks first)
 ```
 
-Options: `--name "…"`, `--y-pin 20` for early boards, `--upload-port 8090` if port 6681 is taken,
-`--no-upload` to skip the upload page, `--latency low` for less audio delay (see below),
-`--keep-pimoroni-screen` (see above). Running `install.sh` again updates the add-on and keeps your settings.
+Reboot when it asks. That's all: the same script does the whole install on Trixie and on Bookworm.
+What it checks and sets up:
 
-Everything comes from Raspberry Pi OS packages, so nothing is compiled. The install takes a few minutes.
+- **Which system it's on** (Trixie or Bookworm) and its Bluetooth version. It shows both before changing
+  anything.
+- **The Pirate Audio hardware settings** in `config.txt`, if they're missing (sound chip and screen).
+- **The Pi's music player**, if Mopidy isn't installed: Mopidy 3.4 with its music library (Mopidy-Local)
+  and the Iris web page (`http://raspberrypi.local:6680/iris`), the same layout Pimoroni's installer uses,
+  playing from `~/Music`. It's Mopidy 3.4 rather than the brand-new Mopidy 4 because Iris doesn't work with
+  Mopidy 4 yet. On Trixie the installer also applies a small fix Mopidy 3.4 needs there (from Mopidy 4).
+- **On Trixie: album art from your phone over Bluetooth** (BlueZ's cover-art support and `bluez-obexd`).
+- Bluetooth audio, the screen and buttons, the music page, and starting everything at power-on.
+
+Options: `--name "…"`, `--y-pin 20` for early boards, `--upload-port 8090` if port 6681 is taken,
+`--no-upload` to skip the music page, `--latency low` for less audio delay (see below),
+`--keep-pimoroni-screen` (see above), `--no-mopidy` (Bluetooth only: don't install Mopidy on a Pi that
+doesn't have it), `--no-phone-art` (don't set up album art over Bluetooth). Running `install.sh` again
+updates the add-on and keeps your settings.
+
+Nothing is compiled: Raspberry Pi OS packages, plus Mopidy and Iris from the Python package index the way
+Pimoroni installs them. The install takes a few minutes (a bit longer when it sets up Mopidy).
+
+### Starting over on a fresh SD card (Trixie)
+
+1. **Save your music first.** Reformatting erases the card. Run `bash install.sh` from this version on your
+   current card (it updates the add-on in place), then on the music page open *Download from the Pi* and
+   click *Download all* (see below). Or copy it from your PC with `scp -r pi@raspberrypi.local:~/Music .`
+   (use your user name and Pi name).
+2. Flash **Raspberry Pi OS Lite** (Trixie is the current version) with Raspberry Pi Imager. In its
+   settings, set the user name, Wi-Fi and SSH so you can log in.
+3. Copy this folder onto the Pi and run `bash install.sh` as above. No need for Pimoroni's installer.
+4. After the reboot, pair your phone again (the new system doesn't know it) and drop your music back on the
+   music page.
 
 ## Pair your phone (once)
 
@@ -53,7 +87,7 @@ After that it works like headphones. When you switch the Pi on, it connects to y
 trying for 3 minutes, so it's fine if the phone is still in your pocket or asleep. You can also pick
 **Pirate Audio** in Control Center at any time. Plug your headphones into the Pirate Audio and play.
 
-## Add music from your PC or phone
+## Add music from your PC or phone (and download it back)
 
 ![Upload page](docs/upload-page.png)
 
@@ -72,8 +106,24 @@ Open **`http://raspberrypi.local:6681`** in a browser on the same Wi-Fi. Use you
   interruption. The songs show up in Iris under *Browse → Local media* (or *Files*). If Mopidy couldn't read a
   song, or its library is switched off, the page says so.
 
+### Download music from the Pi
+
+Under **Download from the Pi** on the same page you can look through the Music folder (click a folder to
+open it; your browser's Back button goes back up) and:
+
+- **download a song** with the arrow next to it;
+- **download a whole folder** (an album, an artist) as a `.zip` with the arrow next to the folder, or with
+  *Download folder* at the top while you're in it;
+- **download everything** with *Download all* at the top level: one `Music.zip` with all your folders.
+
+The `.zip` files aren't compressed (music files don't get smaller), so they come out the same size as the
+music and start downloading straight away, even for a big library. Unzip them to get the folders and songs
+back exactly as they are on the Pi. Album covers and playlists come along. If a big download is interrupted,
+a single song carries on where it stopped; a `.zip` has to start again.
+
 The page only works on your local network. If you use the Pi on shared Wi-Fi (campus, café…), set a password
-under `[upload]` in `settings.ini`, then run `systemctl --user restart pirate-upload`.
+under `[upload]` in `settings.ini`, then run `systemctl --user restart pirate-upload`. The password protects
+downloads too.
 
 ## Buttons
 
@@ -109,7 +159,7 @@ up and down, separately from the phone's own volume.
   Picking a song plays it with the rest of that album, list or folder queued after it.
 - **Queue:** what's playing now (♪) and what's next; pick one to jump to it.
 - **Repeat** (off, all, one song) and **Shuffle**.
-- **Pair a new phone** and **Info** (name, connected phone, headphone volume, the upload page address).
+- **Pair a new phone** and **Info** (name, connected phone, headphone volume, the music page address).
 
 Artists and Songs A–Z need Mopidy's music library (Mopidy-Local). If the menu says it's off, see
 Troubleshooting.
@@ -136,12 +186,16 @@ The first press of **A** plays whatever you listened to last:
 
 - **The Pi's music:** the album art inside your music files (through Mopidy's library), or a cover picture
   in the album's folder (`cover.jpg`, `folder.jpg`…).
-- **Your phone:** phones can send album art over Bluetooth, but only to newer Bluetooth software than
-  Raspberry Pi OS Bookworm has (it arrived in BlueZ 5.79; Trixie has it). On Bookworm, when the Pi is
+- **Your phone, on Trixie:** the iPhone sends the album art itself over Bluetooth, the way car stereos get
+  it. It works offline, and it's the exact picture your phone shows. This needs Bluetooth software newer
+  than Bookworm's (BlueZ 5.79+; Trixie has 5.82), which is why it's Trixie only. The phone starts sending
+  pictures from the song after it connects, so the song that's already playing gets the online lookup.
+- **When the phone doesn't send one** (on Bookworm, or for a song the phone has no art for), and the Pi is
   online, the add-on looks the cover up in Apple's iTunes catalogue by artist and album name (only those
-  names are sent) and keeps a copy, so that album also has its art offline from then on. Set
-  `art_lookup = no` under `[bluetooth]` in `settings.ini` to turn that off. Without art, the screen shows a
-  colored card for each album.
+  names are sent).
+- Either way a copy is kept for each album, so it shows straight away (and offline) next time. In
+  `settings.ini` under `[bluetooth]`, `phone_art = no` stops asking the phone and `art_lookup = no` stops
+  the online lookup. Without art, the screen shows a colored card for each album.
 
 ## How it shares with Mopidy
 
@@ -174,7 +228,7 @@ link add roughly another 0.1-0.2 s that the Pi can't change.
 ## Commands
 
 ```bash
-pirate-bluetooth                     # status: name, pairing mode, paired phones
+pirate-bluetooth                     # status: name, pairing mode, paired phones, where album art comes from
 pirate-bluetooth pair                # pairing mode for 3 minutes
 pirate-bluetooth name "Kite's Pirate"
 pirate-bluetooth forget "Kite's iPhone"   # or: forget all
@@ -185,7 +239,8 @@ pirate-bluetooth logs upload         # just one part: screen, upload, audio or m
 ```
 
 Settings are in `~/.config/pirate-bluetooth/settings.ini`. They include how long it looks for your phone
-after power-on (`reconnect_seconds`), the online album art lookup (`art_lookup`), when the screen turns off
+after power-on (`reconnect_seconds`), album art from the phone (`phone_art`) and the online lookup
+(`art_lookup`), when the screen turns off
 (`sleep_after`, 0 = never), the Y-button pin on early boards, screen rotation and the volume step.
 After editing, run `systemctl --user restart pirate-bluetooth`.
 
@@ -193,7 +248,8 @@ After editing, run `systemctl --user restart pirate-bluetooth`.
 
 - **Apple Music downloads stay on your phone.** The phone plays them and sends the sound over Bluetooth, so
   offline listening works anywhere.
-- **No album art over Bluetooth:** the screen draws a colored card for each album instead.
+- **No album art at all** (offline on Bookworm, or a song nobody has art for): the screen draws a colored
+  card for each album instead.
 - Bluetooth audio uses a standard Bluetooth codec, so it's slightly lower quality than a wired or AirPlay
   connection, but fine for headphones.
 - Everything starts at power-on, with no login needed. If your user services (Mopidy's included) only
@@ -211,7 +267,7 @@ After editing, run `systemctl --user restart pirate-bluetooth`.
   `systemctl status pirate-bluealsa pirate-bluealsa-aplay`.
 - **Y does nothing.** Boards made before 23 January 2020 use BCM 20. Set `y_pin = 20` in `settings.ini`.
 - **Picture upside down.** Set `rotation = 270` in `settings.ini`.
-- **The upload page doesn't open.** Check that your PC or phone is on the same Wi-Fi as the Pi, and try the IP
+- **The music page doesn't open.** Check that your PC or phone is on the same Wi-Fi as the Pi, and try the IP
   address from the info screen instead of `raspberrypi.local`. Then check `systemctl --user status pirate-upload`.
   Some campus and public networks block devices from reaching each other.
 - **The screen stays dark, or the buttons do nothing.** `pirate-bluetooth logs screen` shows why. If
@@ -223,6 +279,15 @@ After editing, run `systemctl --user restart pirate-bluetooth`.
   line to `~/.config/mopidy/mopidy.conf` (keeping a copy of the old file), restarts Mopidy with its queue
   put back, and adds your music to the library. `pirate-bluetooth logs upload` shows any songs Mopidy couldn't
   read.
+
+- **No album art from the phone on Trixie.** Run `pirate-bluetooth`: the *Phone album art* line says what's
+  missing (it should read "sent by the phone over Bluetooth…"). After the installer's reboot, turn the
+  iPhone's Bluetooth off and on once. `pirate-bluetooth logs screen` shows whether the phone offered art
+  ("Connected to the phone for album art over Bluetooth"). Some apps don't share art; the online lookup
+  covers those when the Pi is online.
+- **A .zip download fails part-way.** The Pi stops a `.zip` it couldn't finish (for example when a file
+  can't be read), so the browser shows it as failed instead of saving a broken file. Try again, or download
+  that folder's songs one at a time; `pirate-bluetooth logs upload` names the file.
 
 ## Uninstall
 
@@ -240,9 +305,12 @@ bash uninstall.sh --purge   # also removes settings.ini and the extra packages i
 | "Pirate Headphone" volume control | a marked block in `/etc/asound.conf` (backed up) | removed |
 | Audio delay setting | `/etc/default/pirate-bluetooth-latency` | removed |
 | Shows up as headphones on phones | one line in `/etc/bluetooth/main.conf` (backed up) | original line put back |
+| Album art over Bluetooth (Trixie) | `Experimental = true` in `/etc/bluetooth/main.conf`; packages `bluez-obexd`, `dbus-user-session` (if missing) | line removed; packages removed with `--purge` |
+| Pirate Audio hardware (only if missing) | `dtoverlay=hifiberry-dac`, `gpio=25=op,dh`, `dtparam=spi=on` in `config.txt` | left in (the Pirate Audio needs them) |
+| Mopidy, Mopidy-Local, Iris (only if Mopidy wasn't installed) | `~/.virtualenvs/mopidy`, user service `mopidy`, `~/.config/mopidy/mopidy.conf`, GStreamer packages | removed; with `--purge` also `mopidy.conf`, Mopidy's library index and the packages; your music stays |
 | Screen/buttons/pairing program | `~/.local/share/pirate-bluetooth`, user service `pirate-bluetooth` | removed |
 | `pirate-bluetooth` command | `/usr/local/bin` | removed |
-| Music upload page | user service `pirate-upload` (port 6681) | removed; your uploaded music stays |
+| Music page (upload and download) | user service `pirate-upload` (port 6681) | removed; your music stays |
 | Start at power-on | `loginctl enable-linger` for your user, only if it was off | turned back off |
 | Mopidy's own screen and buttons | `enabled = false` under `[pidi]` and `[raspberry-gpio]` in `mopidy.conf` (not with `--keep-pimoroni-screen`) | switched back on |
 | Mopidy's music library | only if you run `pirate-bluetooth library on`: `enabled = true` under `[local]` in `mopidy.conf` (old file kept as `mopidy.conf.before-library-on`) | left on (it's part of Pimoroni's setup) |
@@ -251,5 +319,6 @@ bash uninstall.sh --purge   # also removes settings.ini and the extra packages i
 ## Credits
 
 [BlueALSA](https://github.com/arkq/bluez-alsa) and [BlueZ](https://www.bluez.org/) do the Bluetooth work.
+[Mopidy](https://mopidy.com/) and [Iris](https://github.com/jaedb/Iris) play the Pi's own music.
 Pimoroni's [Pirate Audio](https://github.com/pimoroni/pirate-audio) software and
 [st7789 library](https://github.com/pimoroni/st7789-python) drive the screen. Each is used under its own license.

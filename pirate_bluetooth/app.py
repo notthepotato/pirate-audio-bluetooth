@@ -32,7 +32,7 @@ log = logging.getLogger("pirate_bluetooth")
 
 DEFAULTS = {
     "bluetooth": {"name": "Pirate Audio", "pair_seconds": "180", "reconnect_on_start": "yes",
-                  "reconnect_seconds": "180", "boot_wait": "300", "art_lookup": "yes",
+                  "reconnect_seconds": "180", "boot_wait": "300", "art_lookup": "yes", "phone_art": "yes",
                   "auto_pair_if_none": "yes", "handback_after": "60", "bus": "system"},
     "display": {"rotation": "90", "spi_mhz": "80", "sleep_after": "120"},
     "buttons": {"y_pin": "24", "hold_time": "0.7"},
@@ -50,6 +50,7 @@ FRESH_BOOT_S = 600  # started this soon after power-on (and first time this boot
 PRESS_RECONNECT_S = 30  # A pressed with no phone connected: keep trying this long
 PLAY_WAIT_S = 12  # ...and send Play if the phone shows up within this long after it connects
 DAC_WAIT_S = 4  # how long to wait for the phone's audio to let go of the sound card
+ART_WAIT_S = 6  # the phone offers album art over Bluetooth: wait this long for it before looking online
 REPEAT_LABELS = {"off": "Off", "all": "All", "one": "One song"}
 
 
@@ -131,10 +132,10 @@ class App:
         self.pi = None  # MopidyRemote when the Pi's own music is controlled from here
         self.pi_state = {}
         self.unified = True
-        mopidy_files = mopidyconf.config_files() if self.mopidy.enabled else []
+        mopidy_argv = mopidyconf.service_command() if self.mopidy.enabled else None
+        mopidy_files = mopidyconf.config_files(mopidy_argv) if self.mopidy.enabled else []
         if self.mopidy.enabled:
-            uses_screen = [ext for ext in ("pidi", "raspberry-gpio")
-                           if mopidyconf.extension_enabled(mopidy_files, ext) is not False]
+            uses_screen = mopidyconf.runs_own_screen(mopidy_argv, mopidy_files)
             if uses_screen:
                 self.unified = False
                 log.info("Mopidy still runs its own screen/buttons (%s): sharing them by hand-off",
@@ -152,6 +153,16 @@ class App:
                              lookup_online=cfg.getboolean("bluetooth", "art_lookup"),
                              music_dirs=[d.replace("$XDG_MUSIC_DIR", "~/Music") for d in music_dirs])
         self.bt_art_key = None
+        self.bt_address = None
+        self.bt_obex_port = None
+        self.bt_img_handle = None
+        self._bt_art_asked = None  # (key, handle) last asked of the phone
+        self._art_fallback = 0  # timer: look the art up online if the phone hasn't sent it by then
+        self.cover = None  # album art straight from the phone over Bluetooth (Trixie)
+        if cfg.getboolean("bluetooth", "phone_art"):
+            from .coverart import CoverArt
+            self.cover = CoverArt(os.path.join(CACHE_DIR, "art", "incoming"), self.on_phone_picture,
+                                  on_connected=lambda: self._phone_art(False))
         self.pi_art_key = None
         self.pi_track_uri = None
 
@@ -449,6 +460,55 @@ class App:
         if key in (self.bt_art_key, self.pi_art_key):
             self.request_render()
 
+    # == the phone's album art: sent by the phone itself (Trixie), else looked up online ==========
+    def _phone_art(self, song_changed):
+        if song_changed:
+            self._cancel_art_fallback()
+            self._bt_art_asked = None
+            self.bt_art_key = (self.art.for_phone(self.np.artist, self.np.album, self.np.title, lookup=False)
+                               if self.np.has_track else None)
+        key = self.bt_art_key
+        if not key or self.art.known(key):
+            return  # nothing playing, or a copy of this album's art is already here
+        cover = self.cover
+        if cover and cover.connected and self.bt_img_handle:
+            if self._bt_art_asked != (key, self.bt_img_handle):
+                self._bt_art_asked = (key, self.bt_img_handle)
+                cover.fetch(self.bt_img_handle, key)
+        elif cover and cover.offered and not cover.connected:
+            # The phone offers art over Bluetooth, but the art connection isn't up yet (pictures are only
+            # named once it is): give it a moment before asking the internet. Once it's up, a song
+            # without a picture goes online straight away: either the phone has none for it, or it
+            # started before the connection did (BlueZ doesn't ask again).
+            if not self._art_fallback:
+                self._art_fallback = GLib.timeout_add_seconds(ART_WAIT_S, self._art_fallback_due, key)
+        else:
+            self._lookup_phone_art(key)
+
+    def _lookup_phone_art(self, key):
+        self._cancel_art_fallback()
+        if key and key == self.bt_art_key and not self.art.known(key):
+            self.art.for_phone(self.np.artist, self.np.album, self.np.title)
+
+    def _art_fallback_due(self, key):
+        self._art_fallback = 0
+        self._lookup_phone_art(key)
+        return False
+
+    def _cancel_art_fallback(self):
+        if self._art_fallback:
+            GLib.source_remove(self._art_fallback)
+            self._art_fallback = 0
+
+    def on_phone_picture(self, key, path):
+        """CoverArt finished: path is the picture the phone sent, or None if it didn't work out."""
+        if path:
+            self.art.store_phone_art(key, path)  # -> on_art
+            if key == self.bt_art_key:
+                self._cancel_art_fallback()
+        else:
+            self._lookup_phone_art(key or self.bt_art_key)
+
     # == Bluetooth events =============================================================
     def on_bt(self, changes):
         now = time.monotonic()
@@ -469,11 +529,20 @@ class App:
             self.phone = phone
         if "Player" in changes:
             self.has_player = bool(changes["Player"])
-        if "Track" in changes and self.np.apply_track(changes["Track"]):
-            log.info("Now playing: %s - %s", self.np.artist, self.np.title)
-            self.bt_art_key = (self.art.for_phone(self.np.artist, self.np.album, self.np.title)
-                               if self.np.has_track else None)
-            self.wake()
+        if "Address" in changes or "ObexPort" in changes:
+            self.bt_address = changes.get("Address", self.bt_address)
+            self.bt_obex_port = changes.get("ObexPort", self.bt_obex_port)
+            if self.cover:
+                self.cover.set_target(self.bt_address, self.bt_obex_port)
+        if "Track" in changes:
+            song_changed = self.np.apply_track(changes["Track"])
+            handle = str((changes["Track"] or {}).get("ImgHandle") or "") or None
+            if song_changed:
+                log.info("Now playing: %s - %s", self.np.artist, self.np.title)
+                self.wake()
+            if song_changed or handle != self.bt_img_handle:
+                self.bt_img_handle = handle
+                self._phone_art(song_changed)
         was_playing = self.np.playing
         if "Status" in changes:
             self.np.apply_status(changes["Status"], now)
@@ -976,6 +1045,8 @@ class App:
     def quit(self, *_):
         log.info("Shutting down")
         self._stop.set()
+        if self.cover:
+            self.cover.close()
         self.bt.close()
         if self.pi:
             self.pi.close()

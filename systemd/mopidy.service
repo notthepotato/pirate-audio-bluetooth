@@ -1,0 +1,14 @@
+# Installed by the Pirate Audio Bluetooth add-on (same layout as Pimoroni's Pirate Audio installer)
+[Unit]
+Description=Mopidy music server
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=@HOME@
+ExecStart=@HOME@/.virtualenvs/mopidy/bin/mopidy --config @HOME@/.config/mopidy/mopidy.conf
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

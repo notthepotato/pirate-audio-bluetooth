@@ -7,6 +7,7 @@ Only uses the standard library, so the installer can run it with the system Pyth
 """
 
 import configparser
+import glob
 import os
 import re
 import shlex
@@ -76,6 +77,33 @@ def extension_enabled(files, name):
     return cfg.get(name, "enabled", fallback="true").strip().lower() not in ("false", "no", "off", "0")
 
 
+EXTENSION_MODULES = {"pidi": "mopidy_pidi", "raspberry-gpio": "mopidy_raspberry_gpio", "local": "mopidy_local",
+                     "iris": "mopidy_iris"}
+
+
+def extension_installed(argv, name):
+    """Is a Mopidy extension's Python package there for the Mopidy the service runs? None = can't tell.
+
+    Looks next to the service's mopidy program (Pimoroni's and the add-on's installers use a virtualenv)
+    and in the system's Python packages."""
+    if not argv:
+        return None
+    module = EXTENSION_MODULES.get(name, "mopidy_" + name.replace("-", "_"))
+    env = os.path.dirname(os.path.dirname(argv[0]))
+    places = [os.path.join(env, "lib", "python3*", "site-packages", module),
+              os.path.join("/usr/lib/python3/dist-packages", module),
+              os.path.join("/usr/local/lib/python3*", "*-packages", module)]
+    return any(glob.glob(p) for p in places)
+
+
+def runs_own_screen(argv=None, files=None):
+    """Mopidy extensions that would use the Pirate Audio's screen or buttons (switched on and installed)."""
+    argv = argv or service_command()
+    files = files or config_files(argv)
+    return [ext for ext in ("pidi", "raspberry-gpio")
+            if extension_enabled(files, ext) is not False and extension_installed(argv, ext) is not False]
+
+
 def set_option(path, section, key, value, backup_suffix=".before-pirate-bluetooth"):
     """Set `key = value` in [section] of one config file, keeping a copy of the original once.
 
@@ -113,6 +141,9 @@ def set_option(path, section, key, value, backup_suffix=".before-pirate-bluetoot
 def main(argv=None):
     args = sys.argv[1:] if argv is None else argv
     files = config_files()
+    if args == ["own-screen"]:  # which of Mopidy's screen/button extensions are on (one per line)
+        print("\n".join(runs_own_screen()))
+        return 0
     if len(args) == 3 and args[0] == "get":
         value = get(files, args[1], args[2])
         print("" if value is None else value)

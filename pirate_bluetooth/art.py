@@ -2,9 +2,11 @@
 
 * The Pi's own music: the images Mopidy knows for the song (Mopidy-Local pulls them out of the files),
   or else a cover picture in the song's folder (cover.jpg, folder.jpg, ...).
-* Bluetooth: phones only send art over Bluetooth with newer BlueZ than Raspberry Pi OS Bookworm has, so
-  when the Pi is online the cover is looked up in Apple's iTunes catalogue by artist and album (only those
-  names are sent), and kept, so it also shows offline next time. [bluetooth] art_lookup = no turns it off.
+* Bluetooth: on Raspberry Pi OS Trixie the phone itself can send the cover (see coverart.py; app.py
+  hands the picture over with store_phone_art). When it doesn't (Bookworm's BlueZ is too old for that,
+  or the phone doesn't offer it), the cover is looked up in Apple's iTunes catalogue by artist and album
+  when the Pi is online (only those names are sent). Either way a copy is kept per album, so it also shows
+  offline next time. [bluetooth] art_lookup = no turns the online lookup off.
 """
 
 import hashlib
@@ -72,17 +74,33 @@ class ArtLoader:
             self._jobs.put((key, self._mopidy_art, (track_uri, image_urls_fn)))
         return key
 
-    def for_phone(self, artist, album, title):
+    def for_phone(self, artist, album, title, lookup=True):
+        """The key for a phone song's album art. With lookup=False only a copy kept from before is used
+        (the app waits a moment for the phone to send the picture itself before looking it up online)."""
         key = "phone:" + hashlib.sha1(f"{_norm(artist)}|{_norm(album) or _norm(title)}".encode()).hexdigest()
         if key in self._known or key in self._pending:
             return key
         path = self._cache_path(key)
         if os.path.exists(path):
             self._known[key] = path
-        elif artist and (album or title) and self.lookup_online and time.monotonic() >= self._missed.get(key, 0):
+        elif (lookup and artist and (album or title) and self.lookup_online
+              and time.monotonic() >= self._missed.get(key, 0)):
             self._pending.add(key)
             self._jobs.put((key, self._itunes_art, (artist, album, title)))
         return key
+
+    def store_phone_art(self, key, picture):
+        """Keep a picture the phone sent over Bluetooth as this album's art (call on the main loop)."""
+        path = self._cache_path(key)
+        try:
+            os.replace(picture, path)
+        except OSError as err:
+            log.info("Couldn't keep the album art: %s", err)
+            return None
+        self._known[key] = path
+        self._missed.pop(key, None)
+        self._on_ready(key, path)
+        return path
 
     # -- worker ---------------------------------------------------------------------------------
     def _loop(self):
@@ -181,6 +199,8 @@ class ArtLoader:
             log.info("Couldn't download album art: %s", err)
             return None
         path = self._cache_path(key)
+        if os.path.exists(path):  # the phone sent the picture meanwhile
+            return path
         with open(path + ".tmp", "wb") as fh:
             fh.write(data)
         os.replace(path + ".tmp", path)

@@ -1,5 +1,5 @@
 [Unit]
-Description=Pirate Audio music upload page (drag and drop songs into ~/Music)
+Description=Pirate Audio music page (upload songs into ~/Music, download them back)
 Documentation=file://%h/.local/share/pirate-bluetooth/README.md
 
 [Service]
