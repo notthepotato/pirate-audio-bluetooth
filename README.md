@@ -51,7 +51,9 @@ What it checks and sets up:
 
 - **Which system it's on** (Trixie or Bookworm) and its Bluetooth version. It shows both before changing
   anything.
-- **The Pirate Audio hardware settings** in `config.txt`, if they're missing (sound chip and screen).
+- **The Pirate Audio hardware settings** in `config.txt`, if they're missing (sound chip and screen). On
+  Trixie that includes `dtoverlay=spi0-2cs,no_miso`: Trixie's SPI driver otherwise holds GPIO9, which the
+  Pirate Audio uses as the screen's data/command pin, and the screen only lights up without a picture.
 - **The Pi's music player**, if Mopidy isn't installed: Mopidy 3.4 with its music library (Mopidy-Local)
   and the Iris web page (`http://raspberrypi.local:6680/iris`), the same layout Pimoroni's installer uses,
   playing from `~/Music`. It's Mopidy 3.4 rather than the brand-new Mopidy 4 because Iris doesn't work with
@@ -343,7 +345,7 @@ bash uninstall.sh --purge   # also removes settings.ini and the extra packages i
 | Audio delay setting | `/etc/default/pirate-bluetooth-latency` | removed |
 | Shows up as headphones on phones | one line in `/etc/bluetooth/main.conf` (backed up) | original line put back |
 | Album art over Bluetooth (Trixie) | `Experimental = true` in `/etc/bluetooth/main.conf`; packages `bluez-obexd`, `dbus-user-session` (if missing) | line removed; packages removed with `--purge` |
-| Pirate Audio hardware (only if missing) | `dtoverlay=hifiberry-dac`, `gpio=25=op,dh`, `dtparam=spi=on` in `config.txt` | left in (the Pirate Audio needs them) |
+| Pirate Audio hardware (only if missing) | `dtoverlay=hifiberry-dac`, `gpio=25=op,dh`, `dtparam=spi=on` (and on Trixie `dtoverlay=spi0-2cs,no_miso`) in `config.txt` | left in (the Pirate Audio needs them) |
 | Mopidy, Mopidy-Local, Iris (only if Mopidy wasn't installed) | `~/.virtualenvs/mopidy`, user service `mopidy`, `~/.config/mopidy/mopidy.conf`, GStreamer packages | removed; with `--purge` also `mopidy.conf`, Mopidy's library index and the packages; your music stays |
 | Screen/buttons/pairing program | `~/.local/share/pirate-bluetooth`, user service `pirate-bluetooth` | removed |
 | `pirate-bluetooth` command | `/usr/local/bin` | removed |

@@ -365,6 +365,9 @@ def cmd_doctor(_args):
                        ("gpio=25=op,dh", "the headphone amp")):
         if path and want not in lines:
             line(want, f"missing from {path}", f"Add '{want}' to {path} (for {what}), or run install.sh again, then reboot.")
+    if codename == "trixie" and path and not any(re.match(r"dtoverlay=spi0-[12]cs.*no_miso", ln) for ln in lines):
+        line("GPIO9 for the screen", "held by SPI on Trixie",
+             "Run install.sh again: it adds 'dtoverlay=spi0-2cs,no_miso' to config.txt. Then reboot.")
     spi = os.path.exists(f"{ROOT}/dev/spidev0.1")
     if spi:
         line("Screen connection", "SPI is on (/dev/spidev0.1)")

@@ -196,6 +196,20 @@ if [ ! -e "$ROOT/dev/spidev0.1" ] && ! grep -qE '^[[:space:]]*dtparam=spi=on' "$
     SPI_OFF=true
 fi
 [ ${#CONFIG_ADD[@]} -gt 0 ] && CHANGES+=("add to $CONFIG_TXT: ${CONFIG_ADD[*]} (needed for the Pirate Audio, normally already there)")
+# Trixie's kernel keeps GPIO9 for SPI (it's SPI's input pin, which the screen doesn't use), but the screen
+# needs GPIO9 as its data/command pin. Raspberry Pi's spi0-2cs overlay with no_miso leaves GPIO9 free.
+NO_MISO="dtoverlay=spi0-2cs,no_miso"
+if [ "$CODENAME" = trixie ]; then
+    if grep -qE '^[[:space:]]*dtoverlay=spi0-[12]cs.*no_miso' "$CONFIG_TXT"; then
+        :
+    elif grep -qE '^[[:space:]]*dtoverlay=spi0-[12]cs' "$CONFIG_TXT"; then
+        NOTES+=("$CONFIG_TXT already has its own spi0 overlay; if the screen stays blank, add ',no_miso' to it.")
+    else
+        CONFIG_ADD+=("$NO_MISO")
+        CHANGES+=("add '$NO_MISO' to $CONFIG_TXT: on Trixie the SPI driver otherwise holds GPIO9, the
+      screen's data/command pin, and the screen stays blank (the screen doesn't use SPI's input pin)")
+    fi
+fi
 $SPI_OFF && CHANGES+=("enable SPI for the Pirate Audio screen")
 
 CARD="$(awk -F'[][]' 'tolower($0) ~ /hifiberry/ {gsub(/ /, "", $2); print $2; exit}' "$ROOT/proc/asound/cards" 2>/dev/null || true)"
@@ -435,6 +449,12 @@ mkdir -p "$CONF_DIR"
 if [ ${#CONFIG_ADD[@]} -gt 0 ] || $SPI_OFF; then
     step "Pirate Audio hardware settings"
     sudo cp "$CONFIG_TXT" "$CONFIG_TXT.backup-$DATESTAMP"
+    # Lines at the end of config.txt belong to its last [section]: make sure that's [all] (every Pi)
+    LAST_SECTION="$(grep -E '^[[:space:]]*\[[^]]+\]' "$CONFIG_TXT" | tail -n 1 | tr -d '[:space:]')"
+    if [ -n "$LAST_SECTION" ] && [ "$LAST_SECTION" != "[all]" ]; then
+        printf "%s\n" "[all]" | sudo tee -a "$CONFIG_TXT" >/dev/null
+        record_add CONFIG_TXT_ADDED "[all]"
+    fi
     for line in "${CONFIG_ADD[@]}"; do
         printf "%s\n" "$line" | sudo tee -a "$CONFIG_TXT" >/dev/null
         record_add CONFIG_TXT_ADDED "$line"

@@ -16,8 +16,14 @@ log = logging.getLogger(__name__)
 LCD_PORT, LCD_CS, LCD_DC, LCD_BACKLIGHT = 0, 1, 9, 13
 
 
+class HardwareError(Exception):
+    """A screen/button problem that's already described in plain words."""
+
+
 def plain_error(err):
     """An exception as a short line, with the usual causes spelled out."""
+    if isinstance(err, HardwareError):
+        return str(err)
     text = f"{type(err).__name__}: {err}" if str(err) else type(err).__name__
     low = text.lower()
     if "spidev" in low or ("no such file" in low and "spi" in low):
@@ -26,6 +32,9 @@ def plain_error(err):
         text += " - your user isn't in the spi/gpio groups yet (reboot after installing)"
     elif "busy" in low:
         text += " - another program is using the pins (Mopidy's PiDi or raspberry-gpio?)"
+    elif "invalid argument" in low:
+        text += (" - a pin the screen needs is held by another driver (on Trixie, SPI holds GPIO9 unless config.txt"
+                 " has dtoverlay=spi0-2cs,no_miso: run install.sh again and reboot)")
     elif isinstance(err, ImportError):
         text += " - a Python library is missing (run install.sh again)"
     return text
@@ -33,19 +42,31 @@ def plain_error(err):
 
 
 class St7789Display:
+    """Pimoroni's st7789 library, or (if it can't start) the add-on's own small driver below."""
+
     def __init__(self, rotation: int = 90, spi_mhz: int = 80):
         try:
-            from st7789 import ST7789  # Pimoroni st7789 >= 1.0 (gpiod, works on Pi 5)
-        except ImportError:
-            from ST7789 import ST7789  # older Pimoroni library (RPi.GPIO)
-        self._dev = ST7789(
-            port=LCD_PORT,
-            cs=LCD_CS,
-            dc=LCD_DC,
-            backlight=LCD_BACKLIGHT,
-            rotation=rotation,
-            spi_speed_hz=spi_mhz * 1_000_000,
-        )
+            try:
+                from st7789 import ST7789  # Pimoroni st7789 >= 1.0 (gpiod, works on Pi 5)
+            except ImportError:
+                from ST7789 import ST7789  # older Pimoroni library (RPi.GPIO)
+            self._dev = ST7789(
+                port=LCD_PORT,
+                cs=LCD_CS,
+                dc=LCD_DC,
+                backlight=LCD_BACKLIGHT,
+                rotation=rotation,
+                spi_speed_hz=spi_mhz * 1_000_000,
+            )
+        except Exception as first:
+            import gc
+            gc.collect()  # let go of anything the failed attempt opened
+            try:
+                self._dev = OwnSt7789(rotation=rotation, spi_hz=spi_mhz * 1_000_000)
+            except Exception as second:
+                raise HardwareError(f"{plain_error(second)} (Pimoroni's library: {type(first).__name__}: {first})") \
+                    from second
+            log.info("Screen driven by the add-on's own driver (Pimoroni's library couldn't: %s)", plain_error(first))
         self._lit = True
 
     def show(self, image):
@@ -60,6 +81,9 @@ class St7789Display:
         dev, self._dev = self._dev, None
         if dev is None:
             return
+        if isinstance(dev, OwnSt7789):
+            dev.close()
+            return
         for attr in ("_dc", "_bl", "_rst"):
             pin = getattr(dev, attr, None)
             if isinstance(pin, tuple) and pin and hasattr(pin[0], "release"):
@@ -71,6 +95,136 @@ class St7789Display:
             dev._spi.close()
         except Exception as err:
             log.debug("closing SPI: %s", err)
+
+
+def _find_gpio_chip(gpiod):
+    """The Raspberry Pi's main GPIO chip (the 40-pin header), found by its label, not its number."""
+    import glob
+    found = {}
+    for path in sorted(glob.glob("/dev/gpiochip*")):
+        try:
+            chip = gpiod.Chip(path)
+            label = chip.get_info().label
+        except OSError:
+            continue
+        if label in GPIO_CHIP_LABELS and label not in found:
+            found[label] = chip
+        else:
+            chip.close()
+    for label in GPIO_CHIP_LABELS:
+        if label in found:
+            for other, chip in found.items():
+                if other != label:
+                    chip.close()
+            return found[label]
+    raise OSError("no Raspberry Pi GPIO chip found in /dev/gpiochip*")
+
+
+class OwnSt7789:
+    """A small ST7789 driver (spidev + libgpiod) for the Pirate Audio's 240x240 screen.
+
+    Used when Pimoroni's library can't start. It finds the GPIO chip by its label and claims the
+    data/command and backlight pins one at a time, so an error says exactly which pin is the problem."""
+
+    def __init__(self, rotation=90, spi_hz=80_000_000, port=LCD_PORT, cs=LCD_CS, dc=LCD_DC, bl=LCD_BACKLIGHT):
+        import gpiod
+        import spidev
+        from gpiod.line import Direction, Value
+        self._Value = Value
+        self._rotation = rotation
+        self._spi = None
+        self._lines = []
+        try:
+            chip = _find_gpio_chip(gpiod)
+            try:
+                out = lambda v: gpiod.LineSettings(direction=Direction.OUTPUT, output_value=v)  # noqa: E731
+                for pin, what, start in ((dc, "data/command", Value.INACTIVE), (bl, "backlight", Value.INACTIVE)):
+                    try:
+                        self._lines.append(chip.request_lines(consumer=f"pirate-bluetooth-lcd-{what}",
+                                                              config={pin: out(start)}))
+                    except Exception as err:
+                        raise HardwareError(f"GPIO{pin} (the screen's {what} pin) can't be claimed: "
+                                            f"{plain_error(err)}") from err
+            finally:
+                chip.close()
+            self._dc_req, self._bl_req = self._lines
+            self._dc, self._bl = dc, bl
+            self._spi = spidev.SpiDev()
+            self._spi.open(port, cs)
+            self._spi.mode = 0
+            self._spi.max_speed_hz = spi_hz
+            self._init()
+            self.set_backlight(True)
+        except Exception:
+            self.close()
+            raise
+
+    # -- low level --
+    def _send(self, data, is_data):
+        self._dc_req.set_value(self._dc, self._Value.ACTIVE if is_data else self._Value.INACTIVE)
+        data = bytes(data)
+        if hasattr(self._spi, "writebytes2"):
+            self._spi.writebytes2(data)
+        else:
+            for i in range(0, len(data), 4096):
+                self._spi.writebytes(list(data[i:i + 4096]))
+
+    def _cmd(self, command, *data):
+        self._send([command], False)
+        if data:
+            self._send(data, True)
+
+    def _init(self):
+        self._cmd(0x01)  # software reset
+        time.sleep(0.15)
+        self._cmd(0x36, 0x70)  # memory access order
+        self._cmd(0xB2, 0x0C, 0x0C, 0x00, 0x33, 0x33)  # porch
+        self._cmd(0x3A, 0x05)  # 16-bit colour
+        self._cmd(0xB7, 0x14)  # gate control
+        self._cmd(0xBB, 0x37)  # VCOM
+        self._cmd(0xC0, 0x2C)  # LCM control
+        self._cmd(0xC2, 0x01)  # VDV/VRH enable
+        self._cmd(0xC3, 0x12)  # VRH
+        self._cmd(0xC4, 0x20)  # VDV
+        self._cmd(0xD0, 0xA4, 0xA1)  # power
+        self._cmd(0xC6, 0x0F)  # frame rate
+        self._cmd(0xE0, 0xD0, 0x04, 0x0D, 0x11, 0x13, 0x2B, 0x3F, 0x54, 0x4C, 0x18, 0x0D, 0x0B, 0x1F, 0x23)
+        self._cmd(0xE1, 0xD0, 0x04, 0x0C, 0x11, 0x13, 0x2C, 0x3F, 0x44, 0x51, 0x2F, 0x1F, 0x1F, 0x20, 0x23)
+        self._cmd(0x21)  # inverted colours (this panel needs it)
+        self._cmd(0x11)  # wake up
+        time.sleep(0.12)
+        self._cmd(0x29)  # display on
+        time.sleep(0.05)
+
+    # -- what St7789Display uses --
+    def display(self, image):
+        import numpy
+        img = image.convert("RGB")
+        if img.size != (240, 240):
+            img = img.resize((240, 240))
+        px = numpy.rot90(numpy.asarray(img), self._rotation // 90).astype("uint16")
+        rgb565 = ((px[..., 0] & 0xF8) << 8) | ((px[..., 1] & 0xFC) << 3) | (px[..., 2] >> 3)
+        self._cmd(0x2A, 0, 0, 0, 239)  # columns 0-239
+        self._cmd(0x2B, 0, 0, 0, 239)  # rows 0-239
+        self._cmd(0x2C)  # write
+        self._send(rgb565.astype(">u2").tobytes(), True)
+
+    def set_backlight(self, on):
+        self._bl_req.set_value(self._bl, self._Value.ACTIVE if on else self._Value.INACTIVE)
+
+    def close(self):
+        for req in self._lines:
+            try:
+                req.release()
+            except Exception:
+                pass
+        self._lines = []
+        if self._spi is not None:
+            try:
+                self._spi.close()
+            except Exception:
+                pass
+            self._spi = None
 
 
 class PreviewDisplay:
@@ -247,7 +401,7 @@ class GpiodButtons:
 
         self._gpiod = gpiod
         self._names = {5: "A", 6: "B", 16: "X", y_pin: "Y"}
-        chip = self._find_chip(gpiod)
+        chip = _find_gpio_chip(gpiod)
         settings = gpiod.LineSettings(direction=Direction.INPUT, bias=Bias.PULL_UP, edge_detection=Edge.BOTH,
                                       debounce_period=timedelta(milliseconds=20))
         try:
@@ -258,28 +412,6 @@ class GpiodButtons:
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True, name="buttons")
         self._thread.start()
-
-    @staticmethod
-    def _find_chip(gpiod):
-        import glob
-        found = {}
-        for path in sorted(glob.glob("/dev/gpiochip*")):
-            try:
-                chip = gpiod.Chip(path)
-                label = chip.get_info().label
-            except OSError:
-                continue
-            if label in GPIO_CHIP_LABELS and label not in found:
-                found[label] = chip
-            else:
-                chip.close()
-        for label in GPIO_CHIP_LABELS:
-            if label in found:
-                for other, chip in found.items():
-                    if other != label:
-                        chip.close()
-                return found[label]
-        raise OSError("no Raspberry Pi GPIO chip found in /dev/gpiochip*")
 
     def _run(self):
         import select
@@ -318,7 +450,7 @@ def make_buttons(on_event, y_pin: int = 24, hold_time: float = 0.7):
         try:
             buttons = GpiodButtons(on_event, y_pin=y_pin, hold_time=hold_time)
         except Exception as second:
-            raise RuntimeError(f"gpiozero: {first}; libgpiod: {second}") from second
+            raise HardwareError(f"gpiozero: {plain_error(first)}; libgpiod: {plain_error(second)}") from second
         log.info("Buttons read with libgpiod (gpiozero couldn't: %s)", first)
         return buttons
 
