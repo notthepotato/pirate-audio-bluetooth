@@ -45,6 +45,8 @@ LATENCY=""  # empty: keep the current setting (or "normal" on a first install)
 KEEP_PIMORONI_SCREEN=false
 WANT_MOPIDY=true
 PHONE_ART=true
+HOTSPOT=true
+USB_GADGET=true
 ASSUME_YES=false
 CHECK_ONLY=false
 REBOOT_NEEDED=false
@@ -73,6 +75,9 @@ Usage: bash install.sh [options]
   --no-mopidy      On a Pi without Mopidy: don't install it (Bluetooth only, no music stored on the Pi).
   --no-phone-art   Don't set up album art from the phone over Bluetooth (Trixie). The online lookup
                    (settings.ini, art_lookup) is separate.
+  --no-hotspot     No Wi-Fi hotspot (the Pi's own Wi-Fi, for when it can't join yours: from the menu, or by
+                   itself after 3 minutes without Wi-Fi).
+  --no-usb         Don't set up the network over a USB cable to a computer (Trixie, on a Pi Zero, 4 or 5).
   -y, --yes        Don't ask for confirmation.
   -h, --help       Show this help.
 EOF
@@ -91,6 +96,8 @@ while [ $# -gt 0 ]; do
         --keep-pimoroni-screen) KEEP_PIMORONI_SCREEN=true ;;
         --no-mopidy) WANT_MOPIDY=false ;;
         --no-phone-art) PHONE_ART=false ;;
+        --no-hotspot) HOTSPOT=false ;;
+        --no-usb) USB_GADGET=false ;;
         -y|--yes) ASSUME_YES=true ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; fatal "Unknown option: $1" ;;
@@ -102,6 +109,15 @@ done
 # forgets what an earlier run did; uninstall.sh reads this file to undo exactly those changes.
 record() { mkdir -p "$CONF_DIR"; printf '%s=%q\n' "$1" "$2" >> "$RECORD"; }
 record_add() { mkdir -p "$CONF_DIR"; printf '%s+=%q\n' "$1" " $2" >> "$RECORD"; }
+# Lines at the end of config.txt belong to its last [section]: make sure that's [all] (every Pi)
+ensure_all_section() {
+    local last
+    last="$(grep -E '^[[:space:]]*\[[^]]+\]' "$CONFIG_TXT" | tail -n 1 | tr -d '[:space:]')"
+    if [ -n "$last" ] && [ "$last" != "[all]" ]; then
+        printf "%s\n" "[all]" | sudo tee -a "$CONFIG_TXT" >/dev/null
+        record_add CONFIG_TXT_ADDED "[all]"
+    fi
+}
 installed() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed"; }
 version_ge() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$2" ]; }  # is $1 >= $2 ?
 # The BlueZ version that is (or would be) installed, e.g. "5.82"
@@ -242,6 +258,62 @@ fi
 if $BT_ART; then
     WANTED+=(bluez-obexd dbus-user-session)
 fi
+# A way in when the Pi can't join your Wi-Fi (or you're away from it): its own Wi-Fi hotspot, from the menu
+# or by itself after a few minutes without Wi-Fi, and on a Pi that can do it, a network over a USB cable.
+POLKIT_RULE="$ROOT/etc/polkit-1/rules.d/50-pirate-bluetooth-hotspot.rules"
+HOTSPOT_DNSMASQ="$ROOT/etc/NetworkManager/dnsmasq-shared.d/50-pirate-hotspot.conf"
+NETPLAN_CHECK="$ROOT/usr/local/lib/pirate-bluetooth/netplan-check"
+HOTSPOT_ACTION="none"
+if $HOTSPOT; then
+    if ! command -v nmcli >/dev/null 2>&1 || [ ! -d "$ROOT/etc/NetworkManager" ]; then
+        NOTES+=("This Pi doesn't use NetworkManager, so there's no Wi-Fi hotspot.")
+    else
+        # NetworkManager asks polkit who may switch connections; dnsmasq hands out addresses on the hotspot;
+        # iw counts who's connected to it
+        WANTED+=(polkitd dnsmasq-base iw)
+        HOTSPOT_ACTION="set"
+        if [ -f "$POLKIT_RULE" ] && grep -qF "subject.user == \"$USER\"" "$POLKIT_RULE"; then
+            HOTSPOT_ACTION="update"
+        else
+            CHANGES+=("add a Wi-Fi hotspot (user service 'pirate-network'): the Pi's own Wi-Fi, so you can always reach
+      it (SSH, the music page, where you can add a Wi-Fi). Switch it on in the menu (hold A > Wi-Fi hotspot);
+      it also comes on by itself after 3 minutes without Wi-Fi and goes back to your Wi-Fi when it's there.
+      It needs a NetworkManager permission for $USER ($POLKIT_RULE) and gives phones on it no
+      internet route ($HOTSPOT_DNSMASQ). Your saved Wi-Fi networks aren't changed")
+        fi
+    fi
+fi
+USB_ACTION="none"
+USB_PORT_NAME=""
+USB_GADGET_CONF="$ROOT/etc/modules-load.d/usb-gadget.conf"
+CMDLINE_TXT="$(dirname "$CONFIG_TXT")/cmdline.txt"
+# The Pis Raspberry Pi's rpi-usb-gadget supports that take a Pirate Audio and work with a normal cable
+case "$(echo "$MODEL" | sed -E 's/[[:space:]]+Rev[[:space:]].*$//')" in
+    "Raspberry Pi Zero"|"Raspberry Pi Zero W"|"Raspberry Pi Zero 2 W") USB_PORT_NAME="the micro-USB port marked USB (not PWR IN)" ;;
+    "Raspberry Pi 4 Model B"|"Raspberry Pi 5 Model B") USB_PORT_NAME="the USB-C power port" ;;
+esac
+if $USB_GADGET; then
+    if [ -f "$USB_GADGET_CONF" ]; then
+        USB_ACTION="already"
+    elif awk '/^[[:space:]]*\[/ { sec = $0 } /^[[:space:]]*dtoverlay=dwc2/ && sec !~ /^[[:space:]]*\[cm/ { found = 1 }
+              END { exit !found }' "$CONFIG_TXT" || grep -q 'g_ether' "$CMDLINE_TXT" 2>/dev/null; then
+        # (Raspberry Pi OS's own config.txt has a dwc2 line for Compute Module 5 boards only: that's not it)
+        NOTES+=("The Pi's USB port is already set up by hand (dwc2/g_ether in config.txt or cmdline.txt), so the
+      installer leaves the USB connection as it is.")
+    elif [ -z "$USB_PORT_NAME" ]; then
+        NOTES+=("A network over a USB cable isn't possible on this Pi ($MODEL); the Wi-Fi hotspot is the way in.")
+    elif [ "$CODENAME" != trixie ]; then
+        NOTES+=("A network over a USB cable needs Raspberry Pi OS Trixie (Raspberry Pi's rpi-usb-gadget); on
+      ${CODENAME^}, the Wi-Fi hotspot is the way in.")
+    else
+        USB_ACTION="set"
+        WANTED+=(rpi-usb-gadget)
+        CHANGES+=("let a computer reach the Pi over a USB cable, from the next boot (Raspberry Pi's
+      'rpi-usb-gadget on'): plug the computer into $USB_PORT_NAME and SSH in. That port then
+      can't take USB devices like a keyboard or memory stick (uninstall.sh switches it back; --no-usb skips it)")
+    fi
+fi
+
 MISSING=()
 for pkg in "${WANTED[@]}"; do installed "$pkg" || MISSING+=("$pkg"); done
 [ ${#MISSING[@]} -gt 0 ] && CHANGES+=("install packages: ${MISSING[*]}")
@@ -379,6 +451,24 @@ PY
 fi
 
 # ---- report ------------------------------------------------------------------------------------------
+# Wi-Fi power saving can make a Pi drop off Wi-Fi and not come back (worse on a Pi Zero 2 W, whose Wi-Fi
+# and Bluetooth share one radio). NetworkManager's per-connection default can be overridden globally.
+NM_POWERSAVE="$ROOT/etc/NetworkManager/conf.d/pirate-wifi-powersave.conf"
+PS_ACTION="none"
+if [ -d "$ROOT/etc/NetworkManager" ] && [ ! -f "$NM_POWERSAVE" ]; then
+    PS_ACTION="set"
+    CHANGES+=("turn off Wi-Fi power saving ($NM_POWERSAVE), which can make the Pi drop off Wi-Fi
+      and not come back (from the next boot; uninstall.sh removes it)")
+fi
+# A power cut while the Pi saves a Wi-Fi setting can leave an empty file in /etc/netplan (Trixie), and then
+# the Pi may not join any Wi-Fi after the next boot.
+NETPLAN_ACTION="none"
+if [ -d "$ROOT/etc/netplan" ] && [ ! -f "$UNIT_DIR/pirate-netplan-check.service" ]; then
+    NETPLAN_ACTION="set"
+    CHANGES+=("at every boot, move empty network settings files out of /etc/netplan before the Wi-Fi starts
+      (a power cut while saving one can stop the Pi from joining any Wi-Fi): service 'pirate-netplan-check'")
+fi
+
 echo
 success "Pirate Audio Bluetooth add-on"
 echo "  Pi:            $MODEL"
@@ -408,11 +498,11 @@ elif $MOPIDY; then
 fi
 echo
 if $INSTALL_MOPIDY; then
-    echo "Not changed: the default sound output, other sound cards, your Wi-Fi, and anything already"
-    echo "             installed (no upgrades)."
+    echo "Not changed: the default sound output, other sound cards, your saved Wi-Fi networks, and anything"
+    echo "             already installed (no upgrades)."
 else
     echo "Not changed: Mopidy's music, queue and other settings, the default sound output, other sound cards,"
-    echo "             your Wi-Fi, and anything already installed (no upgrades)."
+    echo "             your saved Wi-Fi networks, and anything already installed (no upgrades)."
 fi
 echo
 echo "Will change:"
@@ -449,12 +539,7 @@ mkdir -p "$CONF_DIR"
 if [ ${#CONFIG_ADD[@]} -gt 0 ] || $SPI_OFF; then
     step "Pirate Audio hardware settings"
     sudo cp "$CONFIG_TXT" "$CONFIG_TXT.backup-$DATESTAMP"
-    # Lines at the end of config.txt belong to its last [section]: make sure that's [all] (every Pi)
-    LAST_SECTION="$(grep -E '^[[:space:]]*\[[^]]+\]' "$CONFIG_TXT" | tail -n 1 | tr -d '[:space:]')"
-    if [ -n "$LAST_SECTION" ] && [ "$LAST_SECTION" != "[all]" ]; then
-        printf "%s\n" "[all]" | sudo tee -a "$CONFIG_TXT" >/dev/null
-        record_add CONFIG_TXT_ADDED "[all]"
-    fi
+    ensure_all_section
     for line in "${CONFIG_ADD[@]}"; do
         printf "%s\n" "$line" | sudo tee -a "$CONFIG_TXT" >/dev/null
         record_add CONFIG_TXT_ADDED "$line"
@@ -545,6 +630,70 @@ if [ "$EXP_ACTION" = "set" ]; then
     rm -f "$TMP"
     record EXP_CHANGED yes
 fi
+if [ "$PS_ACTION" = "set" ]; then
+    sudo mkdir -p "$(dirname "$NM_POWERSAVE")"
+    printf '%s\n' "# Written by the Pirate Audio Bluetooth add-on (uninstall.sh removes it)." \
+        "# Wi-Fi power saving off, so the Pi doesn't drop off Wi-Fi. 2 = off." "[connection]" "wifi.powersave = 2" \
+        | sudo tee "$NM_POWERSAVE" >/dev/null
+    record NM_POWERSAVE_ADDED yes
+fi
+if [ "$HOTSPOT_ACTION" != "none" ]; then
+    # Lets the add-on (which runs in the background, where nobody could type a password) switch the hotspot
+    # on and off and save the Wi-Fi networks you add on the music page. polkitd picks the rule up by itself.
+    TMP="$(mktemp)"
+    cat > "$TMP" <<EOF
+// Written by the Pirate Audio Bluetooth add-on (uninstall.sh removes it).
+// Lets $USER switch the Pi's own Wi-Fi hotspot on and off (Pirate Audio menu, music page) and save Wi-Fi networks.
+polkit.addRule(function(action, subject) {
+    if (subject.user == "$USER" && (
+            action.id == "org.freedesktop.NetworkManager.network-control" ||
+            action.id == "org.freedesktop.NetworkManager.settings.modify.system" ||
+            action.id == "org.freedesktop.NetworkManager.wifi.share.protected" ||
+            action.id == "org.freedesktop.NetworkManager.wifi.scan" ||
+            action.id == "org.freedesktop.NetworkManager.enable-disable-wifi")) {
+        return polkit.Result.YES;
+    }
+});
+EOF
+    [ -f "$POLKIT_RULE" ] || record POLKIT_RULE_ADDED yes
+    sudo mkdir -p "$(dirname "$POLKIT_RULE")"
+    sudo install -m 0644 "$TMP" "$POLKIT_RULE"
+    rm -f "$TMP"
+    # Phones and computers on the hotspot get an address but no route to the internet through the Pi (it has
+    # none then), so they keep using their mobile data or other Wi-Fi for the internet.
+    [ -f "$HOTSPOT_DNSMASQ" ] || record HOTSPOT_DNSMASQ_ADDED yes
+    sudo mkdir -p "$(dirname "$HOTSPOT_DNSMASQ")"
+    printf '%s\n' "# Written by the Pirate Audio Bluetooth add-on (uninstall.sh removes it)." \
+        "# On the Pi's own hotspot (wlan0), don't offer a way to the internet or a name server: phones that join it" \
+        "# keep their mobile data for the internet and reach the Pi at 10.42.0.1." \
+        "dhcp-option=tag:wlan0,3" "dhcp-option=tag:wlan0,6" | sudo tee "$HOTSPOT_DNSMASQ" >/dev/null
+fi
+if [ "$NETPLAN_ACTION" = "set" ]; then
+    sudo mkdir -p "$(dirname "$NETPLAN_CHECK")"
+    sudo install -m 0755 "$SCRIPT_DIR/tools/netplan-check" "$NETPLAN_CHECK"
+    sudo install -m 0644 "$SCRIPT_DIR/systemd/pirate-netplan-check.service" "$UNIT_DIR/pirate-netplan-check.service"
+    sudo systemctl daemon-reload
+    sudo systemctl enable pirate-netplan-check
+    record NETPLAN_CHECK_ADDED yes
+fi
+if [ "$USB_ACTION" = "set" ]; then
+    if command -v rpi-usb-gadget >/dev/null 2>&1; then
+        inform "Switching on the USB cable connection (rpi-usb-gadget)"
+        [ -f "$CONFIG_TXT.backup-$DATESTAMP" ] || sudo cp "$CONFIG_TXT" "$CONFIG_TXT.backup-$DATESTAMP"
+        ensure_all_section  # it adds its line at the end of config.txt
+        # --force only skips its "is this model supported?" question: it is (checked above)
+        if sudo rpi-usb-gadget on --force; then
+            record USB_GADGET_ON_BY_US yes
+            REBOOT_NEEDED=true
+        else
+            USB_ACTION="none"
+            warning "Couldn't switch on the USB cable connection; the Wi-Fi hotspot still works"
+        fi
+    else
+        USB_ACTION="none"
+        warning "Raspberry Pi's rpi-usb-gadget isn't available, so no USB cable connection (the Wi-Fi hotspot still works)"
+    fi
+fi
 # Package-provided BlueALSA units (if any) would compete with ours for the same D-Bus name.
 for unit in bluealsa.service bluealsa-aplay.service; do
     if systemctl list-unit-files "$unit" >/dev/null 2>&1 && [ "$(systemctl is-enabled "$unit" 2>/dev/null || true)" = "enabled" ]; then
@@ -594,21 +743,29 @@ fi
     || fatal "Couldn't install Pimoroni's st7789 display library with pip."
 "$APP_DIR/venv/bin/python" -c "import st7789, gpiozero, PIL, gi" \
     || fatal "The screen program's Python libraries didn't import."
+# The hotspot's password: made up here, shown on the Pirate Audio's screen (Info) while the hotspot is on
+HOTSPOT_PW=""
+$HOTSPOT && HOTSPOT_PW="$(python3 -c 'import secrets; print("".join(secrets.choice("abcdefghjkmnpqrstuvwxyz23456789") for _ in range(10)))')"
+fill_settings() {
+    sed -e "s/@NAME@/$NAME/" -e "s/@Y_PIN@/$Y_PIN/" \
+        -e "s/@UPLOAD_PORT@/$UPLOAD_PORT/" -e "s/@UPLOAD_ENABLED@/$($UPLOAD && echo yes || echo no)/" \
+        -e "s/@HOTSPOT_PASSWORD@/$HOTSPOT_PW/" \
+        -e "s#http://127.0.0.1:6680/mopidy/rpc#http://127.0.0.1:$MOPIDY_PORT/mopidy/rpc#"
+}
 if [ -f "$CONF_DIR/settings.ini" ]; then
     inform "Keeping your existing $CONF_DIR/settings.ini"
 else
-    sed -e "s/@NAME@/$NAME/" -e "s/@Y_PIN@/$Y_PIN/" \
-        -e "s/@UPLOAD_PORT@/$UPLOAD_PORT/" -e "s/@UPLOAD_ENABLED@/$($UPLOAD && echo yes || echo no)/" \
-        -e "s#http://127.0.0.1:6680/mopidy/rpc#http://127.0.0.1:$MOPIDY_PORT/mopidy/rpc#" \
-        "$SCRIPT_DIR/config/settings.ini" > "$CONF_DIR/settings.ini"
+    fill_settings < "$SCRIPT_DIR/config/settings.ini" > "$CONF_DIR/settings.ini"
 fi
-if ! grep -q '^\[upload\]' "$CONF_DIR/settings.ini"; then
-    # settings.ini from an earlier version: add the new [upload] section, keep everything else
-    sed -n '/^\[upload\]/,$p' "$SCRIPT_DIR/config/settings.ini" \
-        | sed -e "s/@UPLOAD_PORT@/$UPLOAD_PORT/" -e "s/@UPLOAD_ENABLED@/$($UPLOAD && echo yes || echo no)/" \
-        | { echo; cat; } >> "$CONF_DIR/settings.ini"
-fi
-cp "$SCRIPT_DIR/systemd/pirate-bluetooth.service" "$SCRIPT_DIR/systemd/pirate-upload.service" "$USER_UNIT_DIR/"
+# settings.ini from an earlier version: add the sections it doesn't have yet, keep everything else
+for section in upload wifi; do
+    if ! grep -q "^\[$section\]" "$CONF_DIR/settings.ini"; then
+        awk -v want="[$section]" '/^\[/ { on = ($0 == want) } on' "$SCRIPT_DIR/config/settings.ini" \
+            | fill_settings | { echo; cat; } >> "$CONF_DIR/settings.ini"
+    fi
+done
+cp "$SCRIPT_DIR/systemd/pirate-bluetooth.service" "$SCRIPT_DIR/systemd/pirate-upload.service" \
+    "$SCRIPT_DIR/systemd/pirate-network.service" "$USER_UNIT_DIR/"
 sed "s#@APP_DIR@#$APP_DIR#" "$SCRIPT_DIR/tools/pirate-bluetooth" | sudo tee "$BIN_DIR/pirate-bluetooth" >/dev/null
 sudo chmod 0755 "$BIN_DIR/pirate-bluetooth"
 
@@ -674,6 +831,12 @@ if $UPLOAD; then
 else
     systemctl --user disable --now pirate-upload 2>/dev/null || true
 fi
+if [ "$HOTSPOT_ACTION" != "none" ]; then
+    systemctl --user enable pirate-network
+    systemctl --user restart pirate-network  # on your Wi-Fi, it only watches
+else
+    systemctl --user disable --now pirate-network 2>/dev/null || true
+fi
 
 # ============================================================================================
 #  3. Done
@@ -701,12 +864,49 @@ if $UPLOAD; then
     echo
     echo "Add music from your PC or phone: open http://$(hostname).local:$UPLOAD_PORT"
     [ -n "$PI_IP" ] && echo "  (or http://$PI_IP:$UPLOAD_PORT) and drag songs or whole album folders onto the page."
-    echo "  The same page downloads music from the Pi back to your computer."
+    echo "  The same page downloads music from the Pi back to your computer, and gets songs from SoundCloud"
+    echo "  links (the ones whose artist offers a download)."
 fi
 if $INSTALL_MOPIDY; then
     echo
     echo "The Pi's music player: Iris at http://$(hostname).local:6680/iris (add music on the music page)."
 fi
+if [ "$HOTSPOT_ACTION" != "none" ] || [ "$USB_ACTION" != "none" ]; then
+    echo
+    echo "If the Pi can't get on your Wi-Fi (or you're away from it):"
+fi
+if [ "$HOTSPOT_ACTION" != "none" ]; then
+    # The hotspot's name and password, one per line (the same as 'pirate-bluetooth hotspot' shows)
+    HS="$(python3 - "$CONF_DIR/settings.ini" 2>/dev/null <<'PY' || true
+import configparser, sys
+cfg = configparser.ConfigParser(interpolation=None)
+cfg.read(sys.argv[1])
+pw = cfg.get("wifi", "hotspot_password", fallback="").strip()
+name = cfg.get("wifi", "hotspot_name", fallback="").strip() or cfg.get("bluetooth", "name", fallback="").strip()
+if len(pw) >= 8:
+    print(name or "Pirate Audio")
+    print(pw)
+PY
+)"
+    if [ -n "$HS" ]; then
+        HS_NAME="$(sed -n 1p <<< "$HS")"
+        HS_PW="$(sed -n 2p <<< "$HS")"
+        echo "  The Pi makes its own Wi-Fi: hold A > Wi-Fi hotspot > Hotspot (it also comes on by itself after"
+        echo "  3 minutes without Wi-Fi). Join \"$HS_NAME\" (password: $HS_PW) on your phone or computer,"
+        echo "  then ssh $USER@10.42.0.1$($UPLOAD && echo " or open http://10.42.0.1:$UPLOAD_PORT, where you can add the Wi-Fi")."
+        echo "  The screen shows all this too, with a QR code your phone's camera can join: Wi-Fi hotspot > How to connect."
+    else
+        echo "  The Wi-Fi hotspot needs a password of 8 or more characters: hotspot_password in $CONF_DIR/settings.ini"
+    fi
+fi
+if [ "$USB_ACTION" != "none" ]; then
+    [ -n "$USB_PORT_NAME" ] || USB_PORT_NAME="the Pi's USB data port"
+    echo "  Or with a USB cable (after the reboot): plug your computer into $USB_PORT_NAME, wait a minute,"
+    echo "  then ssh $USER@$(hostname).local (or $USER@10.12.194.1$($UPLOAD && echo ", music page http://10.12.194.1:$UPLOAD_PORT"))."
+    echo "  On Windows, install Raspberry Pi's driver once first: rpi-usb-gadget-driver-setup.exe from"
+    echo "  https://github.com/raspberrypi/rpi-usb-gadget/releases"
+fi
+echo
 echo "Useful:  pirate-bluetooth (status)   pirate-bluetooth logs -f   bash uninstall.sh"
 if [ -n "$SCREEN_CHECK" ] && [ "$SCREEN_CHECK" != "ok" ]; then
     echo

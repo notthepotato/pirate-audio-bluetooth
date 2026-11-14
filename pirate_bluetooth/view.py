@@ -7,6 +7,7 @@ from typing import List, Optional, Tuple
 @dataclass
 class View:
     # "idle" | "connected" | "playing" | "info" | "pairing" | "confirm" | "handback" | "menu" | "pi_idle"
+    # | "network"
     kind: str = "idle"
     title: str = ""
     artist: str = ""
@@ -37,3 +38,5 @@ class View:
     menu_total: int = 0
     menu_note: str = ""
     menu_icon: str = ""  # picture next to the menu's title (a playlist's icon)
+    # "network" (How to connect): the hotspot's name/password/address, or lines about Wi-Fi and the USB cable
+    net: dict = field(default_factory=dict)

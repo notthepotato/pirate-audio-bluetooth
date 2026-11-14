@@ -12,6 +12,7 @@ from typing import List, Tuple
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
+from . import qr
 from .view import View
 
 log = logging.getLogger(__name__)
@@ -96,6 +97,7 @@ def _ellipsize(draw, text, font, max_width) -> str:
 
 def _wrap(draw, text, font, max_width, max_lines=2) -> List[str]:
     words, lines, line = text.split(), [], ""
+    cut = False
     for word in words:
         candidate = f"{line} {word}".strip()
         if _text_width(draw, candidate, font) <= max_width:
@@ -105,11 +107,12 @@ def _wrap(draw, text, font, max_width, max_lines=2) -> List[str]:
                 lines.append(line)
             line = word
         if len(lines) == max_lines:
+            cut = True  # more words than fit
             break
     if line and len(lines) < max_lines:
         lines.append(line)
     if lines:
-        lines[-1] = _ellipsize(draw, lines[-1], font, max_width)
+        lines[-1] = _ellipsize(draw, lines[-1] + ("…" if cut else ""), font, max_width)
     return lines
 
 
@@ -144,6 +147,7 @@ class Renderer:
         self._accent = (235, 235, 240)
         self._shade = _shade_mask(96, 235)
         self._thumbs = {}  # (path, size) -> (mtime, picture): playlist icons in menus
+        self._qr = (None, None)  # (text, picture)
 
     def _thumb(self, path, size):
         """A small rounded picture for a menu (cached), or None if it can't be read."""
@@ -240,6 +244,7 @@ class Renderer:
             "handback": self._handback,
             "menu": self._menu,
             "pi_idle": self._pi_idle,
+            "network": self._network,
         }.get(view.kind, self._idle)(view)
         if view.overlay and view.kind != "handback":  # the hand-back screen shows its message inline
             frame = self._overlay(frame, view.overlay)
@@ -467,6 +472,68 @@ class Renderer:
             vf = self.fonts.get(14, bold=True, text=value)
             d.text((18, y + 12), _ellipsize(d, value, vf, 204), font=vf, fill=TEXT)
             y += 34
+        return frame
+
+    def _qr_picture(self, text, max_side):
+        """The QR code on a white square (with the light margin phones need), as big as fits in max_side."""
+        if self._qr[0] != text:
+            try:
+                matrix = qr.make(text)
+            except ValueError:
+                self._qr = (text, None)
+                return None
+            n = len(matrix) + 4  # 2 modules of white all round
+            scale = max(2, max_side // n)
+            img = Image.new("RGB", (n * scale, n * scale), (255, 255, 255))
+            d = ImageDraw.Draw(img)
+            for y, row in enumerate(matrix):
+                for x, dark in enumerate(row):
+                    if dark:
+                        d.rectangle(((x + 2) * scale, (y + 2) * scale, (x + 3) * scale - 1, (y + 3) * scale - 1),
+                                    fill=(0, 0, 0))
+            self._qr = (text, img)
+        return self._qr[1]
+
+    def _network(self, view: View) -> Image.Image:
+        """How to reach the Pi: the hotspot (with a QR code a phone's camera can join), or Wi-Fi and USB."""
+        net = view.net or {}
+        frame = Image.new("RGB", (SIZE, SIZE), BG)
+        d = ImageDraw.Draw(frame)
+        self._legend(d, top_left="close")
+        small, bold = self.fonts.get(12), self.fonts.get(15, bold=True, text=net.get("name", ""))
+        if net.get("active"):
+            if net.get("clients"):
+                t = f"{net['clients']} connected"
+                f = self.fonts.get(11)
+                d.text((SIZE - 8 - _text_width(d, t, f), 9), t, font=f, fill=GREEN)
+            pic = self._qr_picture(qr.wifi_text(net.get("name", ""), net.get("password", "")), 116)
+            top = 26
+            if pic:
+                frame.paste(pic, ((SIZE - pic.width) // 2, top))
+                top += pic.height
+            name = _ellipsize(d, net.get("name", ""), bold, 220)
+            self._centered(d, name, top + 4, bold, TEXT)
+            pw = f"Password  {net.get('password', '')}"
+            self._centered(d, pw, top + 23, self.fonts.get(15, bold=True), KEY)
+            where = f"{net.get('ip', '')}:{net['port']}" if net.get("port") else net.get("ip", "")
+            self._centered(d, f"Then open {where}" if net.get("port") else f"Then ssh {net.get('user', '')}@{where}",
+                           top + 46, small, SUBTLE)
+            if net.get("port"):
+                self._centered(d, f"or ssh {net.get('user', '')}@{net.get('ip', '')}", top + 62, small, FAINT)
+            return frame
+        if net.get("starting"):
+            self._centered(d, "Starting the hotspot…", 90, self.fonts.get(18, bold=True), TEXT)
+            self._centered(d, _ellipsize(d, net.get("name", ""), bold, 220), 122, bold, BLUE)
+            self._centered(d, "A QR code to join it shows here", 160, small, FAINT)
+            return frame
+        label_font, value_font = self.fonts.get(11), self.fonts.get(13, bold=True)
+        y = 30
+        for label, value in (net.get("rows") or [])[:5]:
+            d.text((14, y), label.upper(), font=label_font, fill=FAINT)
+            lines = _wrap(d, value, self.fonts.get(13, bold=True, text=value), 212, max_lines=2)
+            for i, line in enumerate(lines):
+                d.text((14, y + 13 + 16 * i), line, font=value_font, fill=TEXT)
+            y += 15 + 16 * len(lines) + 7
         return frame
 
     def _overlay(self, frame: Image.Image, overlay) -> Image.Image:

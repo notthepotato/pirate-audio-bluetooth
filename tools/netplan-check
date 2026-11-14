@@ -1,0 +1,21 @@
+#!/bin/sh
+# Installed by the Pirate Audio Bluetooth add-on (removed by its uninstall.sh). Runs at boot, before
+# NetworkManager: an empty network settings file in /etc/netplan (left by a power cut while the Pi was saving
+# it) is moved to /var/lib/pirate-bluetooth/netplan-empty, and the settings are generated again without it.
+# Files with anything in them are never touched.
+NETPLAN_DIR="${PIRATE_TEST_ROOT:-}/etc/netplan"
+KEEP="${PIRATE_TEST_ROOT:-}/var/lib/pirate-bluetooth/netplan-empty"
+moved=0
+for f in "$NETPLAN_DIR"/*.yaml; do
+    [ -f "$f" ] || continue
+    if ! grep -q '[^[:space:]]' "$f"; then
+        mkdir -p "$KEEP"
+        mv "$f" "$KEEP/$(basename "$f").$(date +%Y%m%d-%H%M%S)"
+        echo "Moved the empty network settings file $f out of the way (to $KEEP)"
+        moved=1
+    fi
+done
+if [ "$moved" = 1 ] && command -v netplan >/dev/null 2>&1; then
+    netplan generate || echo "netplan generate failed; NetworkManager starts with what it has"
+fi
+exit 0

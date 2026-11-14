@@ -166,6 +166,56 @@
   code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; background: var(--panel-2);
     border: 1px solid var(--line); border-radius: 6px; padding: 1px 5px; overflow-wrap: anywhere; }
   #plSaved.bad { color: var(--bad); }
+  .card h3 { font-size: 14px; margin: 18px 0 6px; }
+  .row-form { display: flex; gap: 8px; flex-wrap: wrap; }
+  .row-form input { flex: 1 1 180px; min-width: 0; font: inherit; color: var(--text); background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 10px; padding: 9px 12px; }
+  .row-form input:focus { outline: 2px solid color-mix(in srgb, var(--accent) 60%, transparent); outline-offset: 0; }
+  #scList { list-style: none; margin: 8px 0 0; padding: 0; max-height: 70vh; overflow: auto; }
+  #scList > li { display: flex; gap: 12px; align-items: flex-start; padding: 10px 2px; border-top: 1px solid var(--line); }
+  #scList > li:first-child { border-top: none; }
+  #scList .cover { width: 48px; height: 48px; border-radius: 8px; }
+  #scList .pick { margin-top: 16px; accent-color: var(--accent); flex: none; width: 18px; height: 18px; }
+  #scList .pick:disabled { visibility: hidden; }
+  .scinfo { flex: 1; min-width: 0; }
+  .scinfo .top { display: flex; gap: 8px; align-items: baseline; }
+  .scinfo .top b { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+  .scinfo .meta { color: var(--faint); font-size: 12.5px; }
+  .scinfo .bar { height: 3px; margin-top: 6px; }
+  .scinfo .get-it { margin-left: 0; }
+  .tag.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, transparent); }
+  .tag.acc { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+  #scSignin { margin-top: 14px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel-2); }
+  #scSignin h3 { margin-top: 0; }
+  details summary { cursor: pointer; color: var(--accent); font-weight: 600; font-size: 13.5px; margin-top: 8px; }
+  details .row-form { margin-top: 8px; }
+  .ok-text { color: var(--ok); font-size: 13.5px; }
+  .hsline { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 14px; }
+  .hsline .grow { flex: 1; min-width: 200px; }
+  .hsline label { display: inline-flex; gap: 7px; align-items: center; color: var(--muted); font-size: 13.5px; cursor: pointer; }
+  .hsline input { accent-color: var(--accent); }
+  #wifiSaved { list-style: none; margin: 0; padding: 0; }
+  #wifiSaved li { display: flex; align-items: center; gap: 8px; padding: 7px 2px; border-top: 1px solid var(--line); }
+  #wifiSaved li:first-child { border-top: none; }
+  #wifiSaved .nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #wifiMsg { font-size: 13.5px; margin-top: 10px; }
+  #setForm fieldset { border: none; margin: 0; padding: 0; }
+  #setForm legend { font-size: 14px; font-weight: 700; padding: 0; margin: 16px 0 2px; }
+  #setForm fieldset:first-child legend { margin-top: 2px; }
+  .setnote { color: var(--faint); font-size: 12.5px; margin: 0 0 4px; }
+  .setrow { display: grid; grid-template-columns: 1fr minmax(150px, 230px); gap: 4px 14px; align-items: center;
+    padding: 8px 0; border-top: 1px solid var(--line); }
+  .setrow label { font-size: 14px; }
+  .setrow .help { grid-column: 1 / -1; color: var(--faint); font-size: 12.5px; margin-top: -2px; }
+  .setrow input[type=text], .setrow input[type=number], .setrow input[type=password], .setrow select {
+    width: 100%; font: inherit; color: var(--text); background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 9px; padding: 7px 10px; }
+  .setrow input[type=checkbox] { justify-self: end; width: 20px; height: 20px; accent-color: var(--accent); }
+  .setrow .pw { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; color: var(--muted); }
+  .setrow .pw label { font-size: 12.5px; display: inline-flex; gap: 6px; align-items: center; }
+  .setrow.changed label:first-child { color: var(--accent); }
+  .setrow :disabled { opacity: .55; }
+  @media (max-width: 520px) { .setrow { grid-template-columns: 1fr; } .setrow input[type=checkbox] { justify-self: start; } }
   .hidden { display: none !important; }
 </style>
 </head>
@@ -238,6 +288,41 @@
     </div>
   </section>
 
+  <section class="card" id="scCard">
+    <h2><span class="grow">Get songs from SoundCloud</span><span class="pill hidden" id="scUser"></span></h2>
+    <p class="sub">Paste a link to a song, an album or a playlist (in the SoundCloud app: Share → Copy link). Songs whose
+      artist offers a download come straight to the Pi, often as WAV, with their cover. For the rest you get the
+      artist's own link.</p>
+    <form id="scForm" class="row-form">
+      <input id="scUrl" type="text" inputmode="url" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="https://soundcloud.com/… or https://on.soundcloud.com/…" aria-label="SoundCloud link" required>
+      <button class="primary" id="scGo" type="submit">Look it up</button>
+    </form>
+    <div class="err hidden" id="scError" role="alert"></div>
+    <div class="hidden" id="scResult">
+      <div class="plhead"><b id="scTitle"></b><span id="scSummary" class="sub" style="margin:0"></span></div>
+      <ol id="scList"></ol>
+      <div class="plfoot"><button class="primary" id="scGet">Download to the Pi</button><span id="scNote" aria-live="polite"></span></div>
+    </div>
+    <div class="hidden" id="scSignin">
+      <h3>Sign in to SoundCloud (once)</h3>
+      <p class="sub" style="margin:0">SoundCloud only gives the artists' downloads to signed-in listeners. Your sign-in is
+        kept on the Pi; this page can't show it to anyone.</p>
+      <ol class="steps">
+        <li>Drag this button to your browser's bookmarks bar:
+          <a class="btn" id="scBookmarklet" href="#">Send my SoundCloud sign-in to the Pi</a></li>
+        <li>Open <a href="https://soundcloud.com" target="_blank" rel="noopener">soundcloud.com</a>, sign in if you
+          aren't, and click that bookmark. It brings you back here, signed in.</li>
+      </ol>
+      <details><summary>Or copy it by hand</summary>
+        <p class="sub" style="margin:6px 0 0">On soundcloud.com, press F12 → Application (Chrome, Edge) or Storage
+          (Firefox) → Cookies → https://soundcloud.com, and copy the value of <code>oauth_token</code>.</p>
+        <form id="scTokenForm" class="row-form"><input id="scToken" type="password" autocomplete="off" placeholder="2-…" aria-label="SoundCloud oauth_token"><button id="scTokenSave" type="submit">Sign in</button></form>
+      </details>
+      <div class="err hidden" id="scSigninError" role="alert"></div>
+    </div>
+    <p class="sub hidden" id="scSignedIn" style="margin:12px 0 0"></p>
+  </section>
+
   <section class="card hidden" id="myCard">
     <h2><span class="grow">Your playlists on the Pi</span>
       <button class="link" id="showMissing" type="button">Get missing songs</button></h2>
@@ -275,6 +360,37 @@
     <nav id="crumbs" aria-label="Folder"></nav>
     <ul id="browse"></ul>
     <p id="browseNote" class="hidden"></p>
+  </section>
+
+  <section class="card" id="wifiCard">
+    <h2><span class="grow">Wi-Fi and hotspot</span><span class="pill" id="wifiNow">…</span></h2>
+    <p class="sub" id="wifiSub"></p>
+    <div class="hsline">
+      <span class="grow" id="hsText"></span>
+      <button id="hsToggle" type="button">Switch the hotspot on</button>
+      <label><input type="checkbox" id="hsAuto"> <span id="hsAutoText">Comes on by itself without Wi-Fi</span></label>
+    </div>
+    <h3>Wi-Fi networks the Pi uses</h3>
+    <ul id="wifiSaved"></ul>
+    <h3>Add a Wi-Fi</h3>
+    <form id="wifiForm" class="row-form">
+      <input id="wifiName" list="wifiAround" autocomplete="off" spellcheck="false" placeholder="Wi-Fi name" aria-label="Wi-Fi name" maxlength="32" required>
+      <datalist id="wifiAround"></datalist>
+      <input id="wifiPass" type="password" autocomplete="off" placeholder="Password (empty if open)" aria-label="Wi-Fi password" maxlength="63">
+      <button id="wifiSave" type="submit">Save</button>
+      <button class="primary" id="wifiSaveJoin" type="button">Save and switch to it</button>
+    </form>
+    <div id="wifiMsg" class="hidden" aria-live="polite"></div>
+    <p class="note hidden" id="wifiLock">To change the Pi's Wi-Fi from here, connect to it through its hotspot or USB cable,
+      or give this page a password (settings.ini on the Pi, <code>[upload] password</code>).</p>
+  </section>
+
+  <section class="card" id="setCard">
+    <h2><span class="grow">Settings</span><span class="pill" id="setVersion"></span></h2>
+    <form id="setForm" autocomplete="off"></form>
+    <div class="plfoot"><button class="primary" id="setSave" type="button" disabled>Save settings</button>
+      <button class="link hidden" id="setUndo" type="button">Undo changes</button><span id="setMsg" aria-live="polite"></span></div>
+    <p class="sub" id="setMore" style="margin:12px 0 0"></p>
   </section>
 
   <p class="hint" id="where">Songs are saved in the Music folder on the Pi. In Mopidy, find them under
@@ -442,7 +558,7 @@ function drawLinks(t) {
   const link = (href, text, title) => { const a = el("a", "", text); a.href = href; a.target = "_blank"; a.rel = "noopener"; if (title) a.title = title; box.append(a); };
   if (t.links.itunes) link(t.links.itunes, "iTunes Store" + (t.links.price ? ` (${t.links.price})` : ""), "Bought songs are normal files you can drop on this page");
   link(t.links.bandcamp, "Bandcamp", "Often sold as WAV or FLAC");
-  link(t.links.soundcloud, "SoundCloud", "Some artists offer free downloads");
+  link(t.links.soundcloud, "SoundCloud", "Some artists offer a download: paste the song's link in Get songs from SoundCloud");
   return box;
 }
 $("plForm").onsubmit = (e) => { e.preventDefault(); checkPlaylist($("plUrl").value.trim()); };
@@ -567,6 +683,294 @@ async function showMissing() {
 $("showMissing").onclick = showMissing;
 $("closeMissing").onclick = () => $("missingCard").classList.add("hidden");
 if (!/iPhone|iPad|iPod|Android|Mac OS X/i.test(navigator.userAgent)) $("pcCard").classList.remove("hidden");
+
+// ---------- SoundCloud ----------
+let sc = null;               // the last look-up
+let scPoll = null;
+const scChecked = new Set(); // songs ticked to download (SoundCloud ids, as text)
+function scBookmarklet() {
+  const back = location.origin + location.pathname;
+  const js = "(function(){var m=document.cookie.match(/(?:^|;\\s*)oauth_token=([^;]+)/);" +
+    "if(!m){alert('Sign in to SoundCloud first, then click this bookmark again. (If you are signed in, this browser keeps " +
+    "the sign-in hidden: use the by-hand way on the Pi page.)');return;}" +
+    `location.href=${JSON.stringify(back)}+'#sc-signin='+encodeURIComponent(decodeURIComponent(m[1]));})()`;
+  $("scBookmarklet").href = "javascript:" + js;
+  $("scBookmarklet").onclick = (e) => { e.preventDefault(); alert("Drag this button to your bookmarks bar, then click it on soundcloud.com."); };
+}
+function scShowUser(user) {
+  $("scUser").textContent = user ? "Signed in: " + user : ""; $("scUser").classList.toggle("hidden", !user);
+  const anyOffered = sc && sc.tracks.some((t) => t.downloadable);
+  $("scSignin").classList.toggle("hidden", !!user || !anyOffered);
+  const out = $("scSignedIn");
+  out.replaceChildren();
+  if (user) {
+    out.append(`Signed in to SoundCloud as ${user}. `);
+    const b = el("button", "link", "Sign out"); b.type = "button";
+    b.onclick = async () => { try { await api("/api/soundcloud/signout", {}); } catch (e) {} scShowUser(""); };
+    out.append(b);
+  }
+  out.classList.toggle("hidden", !user);
+}
+async function scLookUp(url) {
+  const go = $("scGo"), err = $("scError");
+  go.disabled = true; go.textContent = "Looking…"; err.classList.add("hidden"); $("scNote").textContent = "";
+  try {
+    sc = await api("/api/soundcloud/check", { url });
+    scChecked.clear();
+    for (const t of sc.tracks) if (t.downloadable && !t.on_pi) scChecked.add(String(t.id));
+    scDraw(); scShowUser(sc.user);
+    $("scResult").classList.remove("hidden");
+    if (Object.values(sc.jobs || {}).some((j) => ["queued", "downloading"].includes(j.state))) scWatch();
+  } catch (e) { err.textContent = e.message === "Failed to fetch" ? "Lost the connection to the Pi." : e.message; err.classList.remove("hidden"); }
+  finally { go.disabled = false; go.textContent = "Look it up"; }
+}
+const SC_STATE = { queued: ["Waiting", "acc"], downloading: ["Downloading", "acc"], done: ["Added", "ok"], exists: ["Already there", "ok"], failed: ["Failed", "bad"] };
+function scDraw() {
+  const jobs = sc.jobs || {};
+  const offered = sc.tracks.filter((t) => t.downloadable).length;
+  $("scTitle").textContent = sc.title;
+  $("scSummary").textContent = sc.kind === "track" ? (offered ? "The artist offers a download" : "No download offered by the artist")
+    : `${sc.tracks.length} songs · ${offered} with a download from the artist`;
+  const list = $("scList"); list.replaceChildren();
+  for (const t of sc.tracks) {
+    const id = String(t.id), job = jobs[id], li = el("li"), cover = el("span", "cover"), box = el("div", "scinfo");
+    const pick = el("input", "pick"); pick.type = "checkbox"; pick.setAttribute("aria-label", "Download " + t.title);
+    pick.disabled = !t.downloadable || (job && ["queued", "downloading"].includes(job.state));
+    pick.checked = scChecked.has(id);
+    pick.onchange = () => { pick.checked ? scChecked.add(id) : scChecked.delete(id); scFoot(); };
+    drawCover(cover, t.artwork);
+    const top = el("div", "top"); top.append(el("b", "", t.title));
+    let tag;
+    if (job) tag = SC_STATE[job.state];
+    else if (t.on_pi) tag = ["On the Pi", "ok"];
+    else if (t.downloadable) tag = ["Download offered", "acc"];
+    else if (t.limit_reached) tag = ["Download limit reached", "warn"];
+    else tag = ["No download", ""];
+    top.append(el("span", "tag " + tag[1], tag[0]));
+    box.append(top, el("div", "meta", [t.artist, fmtLen(t.duration), t.uploader && t.uploader !== t.artist ? "posted by " + t.uploader : ""].filter(Boolean).join(" · ")));
+    if (job && job.state === "downloading") {
+      const bar = el("div", "bar"), fill = el("i"); bar.append(fill);
+      fill.style.width = job.total ? (100 * job.done / job.total) + "%" : "5%"; box.append(bar);
+      box.append(el("div", "meta", job.total ? `${fmtBytes(job.done)} of ${fmtBytes(job.total)}` : fmtBytes(job.done)));
+    } else if (job && (job.state === "done" || job.state === "exists")) box.append(el("div", "meta", "→ " + job.path));
+    else if (job && job.state === "failed") box.append(el("div", "meta", job.error));
+    else if (t.on_pi) box.append(el("div", "meta", "→ " + t.on_pi));
+    else if (t.maybe) box.append(el("div", "meta", "Something like it is on the Pi: " + t.maybe));
+    const links = el("div", "get-it");
+    const link = (href, text, title) => { const a = el("a", "", text); a.href = href; a.target = "_blank"; a.rel = "noopener"; if (title) a.title = title; links.append(a); };
+    if (!t.downloadable && t.buy_url) link(t.buy_url, (t.buy_title || "Buy") + " ↗", "The artist's own link for this song");
+    if (t.url) link(t.url, "On SoundCloud ↗");
+    if (!t.downloadable && !t.on_pi) link(t.bandcamp, "Bandcamp", "Often sold as WAV or FLAC");
+    box.append(links);
+    li.append(pick, cover, box); list.append(li);
+  }
+  scFoot();
+}
+function scFoot() {
+  const n = scChecked.size, b = $("scGet");
+  b.disabled = !n;
+  b.textContent = n ? `Download ${n} song${n === 1 ? "" : "s"} to the Pi` : "Download to the Pi";
+  b.classList.toggle("hidden", !sc.tracks.some((t) => t.downloadable));
+}
+function scWatch() {
+  clearInterval(scPoll);
+  scPoll = setInterval(async () => {
+    let data; try { data = await api("/api/soundcloud/jobs"); } catch (e) { return; }
+    const before = Object.values(sc.jobs || {}).filter((j) => ["done"].includes(j.state)).length;
+    sc.jobs = data.jobs; scDraw();
+    const jobs = Object.values(data.jobs), busy = jobs.some((j) => ["queued", "downloading"].includes(j.state));
+    const added = jobs.filter((j) => j.state === "done").length;
+    if (added > before) { refreshStatus(); watchScan(); browse(browsePath, "none"); watchPlaylists(); }
+    if (jobs.some((j) => j.code === "signin")) scShowUser("");
+    if (!busy) {
+      clearInterval(scPoll);
+      const failed = jobs.filter((j) => j.state === "failed").length;
+      $("scNote").textContent = (added ? `${added} added to the Pi's music (in the SoundCloud folder).` : "") + (failed ? ` ${failed} didn't work (see why above).` : "");
+    }
+  }, 1500);
+}
+$("scForm").onsubmit = (e) => { e.preventDefault(); scLookUp($("scUrl").value.trim()); };
+$("scGet").onclick = async () => {
+  $("scGet").disabled = true; $("scNote").textContent = "";
+  try {
+    const data = await api("/api/soundcloud/download", { ids: Array.from(scChecked) });
+    sc.jobs = data.jobs; scChecked.clear(); scDraw(); scWatch();
+  } catch (e) {
+    $("scNote").textContent = e.message;
+    if (/Sign in/.test(e.message)) { scShowUser(""); $("scSignin").classList.remove("hidden"); $("scSignin").scrollIntoView({ behavior: "smooth", block: "center" }); }
+    scFoot();
+  }
+};
+async function scSignIn(token) {
+  const err = $("scSigninError"); err.classList.add("hidden");
+  try {
+    const data = await api("/api/soundcloud/signin", { token });
+    scShowUser(data.user); $("scToken").value = "";
+    return true;
+  } catch (e) { err.textContent = e.message; err.classList.remove("hidden"); $("scSignin").classList.remove("hidden"); return false; }
+}
+$("scTokenForm").onsubmit = (e) => { e.preventDefault(); scSignIn($("scToken").value); };
+scBookmarklet();
+async function scFromHash() {  // back from the bookmark on soundcloud.com: sign in with what it brought (then forget it here)
+  const m = /^#sc-signin=(.+)$/.exec(location.hash);
+  if (!m) return false;
+  history.replaceState(null, "", location.pathname + location.search);
+  let token = ""; try { token = decodeURIComponent(m[1]); } catch (e) {}
+  if (await scSignIn(token)) $("scCard").scrollIntoView({ block: "start" });
+  return true;
+}
+window.addEventListener("hashchange", scFromHash);
+(async () => {
+  if (!(await scFromHash())) { try { const data = await api("/api/soundcloud/jobs"); scShowUser(data.user); } catch (e) {} }
+})();
+
+// ---------- Wi-Fi and the hotspot ----------
+let net = null;
+async function loadNetwork(data) {
+  if (!data) { try { data = await api("/api/network"); } catch (e) { $("wifiNow").textContent = "unknown"; return; } }
+  net = data;
+  const st = data.status || {}, wifi = st.wifi || {}, hs = st.hotspot || {}, usb = st.usb || {};
+  const port = location.port || "6681";
+  $("wifiNow").textContent = hs.active ? `Hotspot on: ${hs.name}` : wifi.state === "connected" && wifi.ssid ? `On ${wifi.ssid}` : data.status ? "No Wi-Fi" : "unknown";
+  const mins = Math.max(1, Math.round((hs.after || 180) / 60));
+  $("wifiSub").textContent = data.error || (`If the Pi can't get on a Wi-Fi it knows, it makes its own after ${mins} min` +
+    (hs.name ? `: join “${hs.name}”` : "") + (data.can_change && hs.password ? ` (password ${hs.password})` : " (the password is on the Pirate Audio: hold A › Wi-Fi hotspot › How to connect)") +
+    `, then open http://${hs.ip || "10.42.0.1"}:${port} and add the Wi-Fi below.` +
+    (usb.enabled ? ` A USB cable works too: plug a computer into ${usb.port}.` : ""));
+  $("hsText").textContent = hs.active ? `Hotspot on${hs.clients ? ` · ${hs.clients} connected` : ""}` + (hs.reason === "auto" ? " (no Wi-Fi found)" : "")
+    : hs.error ? hs.error : "Hotspot off";
+  $("hsToggle").textContent = hs.active ? "Switch the hotspot off" : "Switch the hotspot on";
+  $("hsAuto").checked = !!hs.auto;
+  $("hsAutoText").textContent = `Comes on by itself after ${mins} min without Wi-Fi`;
+  for (const id of ["hsToggle", "hsAuto", "wifiSave", "wifiSaveJoin", "wifiName", "wifiPass"]) $(id).disabled = !data.can_change;
+  $("wifiLock").classList.toggle("hidden", !!data.can_change);
+  const list = $("wifiSaved"); list.replaceChildren();
+  for (const w of data.saved) {
+    const li = el("li"), here = wifi.state === "connected" && wifi.ssid === w.ssid;
+    li.append(el("span", "nm", w.ssid));
+    if (here) li.append(el("span", "tag ok", "Connected"));
+    else if ((data.around || []).some((a) => a.ssid === w.ssid)) li.append(el("span", "tag", "In range"));
+    if (data.can_change && !here) {
+      const join = el("button", "link", "Switch to it"); join.type = "button";
+      join.onclick = () => wifiDo("/api/wifi/join", { uuid: w.uuid }, `Switching to ${w.ssid}…` + leaving(hs));
+      li.append(join);
+    }
+    if (data.can_change) {
+      const forget = el("button", "link", "Forget"); forget.type = "button";
+      forget.onclick = () => { if (confirm(`Forget ${w.ssid}? The Pi won't join it any more.` + (here ? " It's the Wi-Fi the Pi is on now." : ""))) wifiDo("/api/wifi/forget", { uuid: w.uuid }, `Forgot ${w.ssid}.`); };
+      li.append(forget);
+    }
+    list.append(li);
+  }
+  if (!data.saved.length) list.append(el("li", "meta", "None saved yet."));
+  const dl = $("wifiAround"); dl.replaceChildren();
+  for (const a of data.around || []) { const o = el("option"); o.value = a.ssid; o.label = `${a.signal}% ${a.security || "open"}`; dl.append(o); }
+}
+function leaving(hs) {
+  return hs && hs.active ? " The hotspot goes off now; if the Pi can't join, it comes back in about a minute." : "";
+}
+async function wifiDo(path, body, message) {
+  const out = $("wifiMsg"); out.className = ""; out.textContent = "…";
+  try { const data = await api(path, body); out.className = "ok-text"; out.textContent = message; loadNetwork(data); }
+  catch (e) { out.className = "err"; out.textContent = e.message === "Failed to fetch" ? "Lost the connection to the Pi (it may be switching networks)." : e.message; }
+}
+$("hsToggle").onclick = () => {
+  const on = !(net && net.status && net.status.hotspot && net.status.hotspot.active);
+  if (on && !confirm("Switch the hotspot on? The Pi leaves its Wi-Fi, so this page stops working here until you join the hotspot.")) return;
+  wifiDo("/api/network/hotspot", { on }, on ? "Switching the hotspot on…" : "Hotspot off: the Pi looks for its Wi-Fi.");
+};
+$("hsAuto").onchange = () => wifiDo("/api/network/auto", { auto: $("hsAuto").checked }, "Saved.");
+async function wifiAdd(join) {
+  const ssid = $("wifiName").value.trim(), password = $("wifiPass").value;
+  if (!ssid) return $("wifiName").focus();
+  const hs = net && net.status && net.status.hotspot;
+  await wifiDo("/api/wifi/add", { ssid, password, join }, join ? `Saved. Switching to ${ssid}…` + leaving(hs) : `Saved ${ssid}. The Pi joins it by itself when it's in range.`);
+  $("wifiPass").value = "";
+}
+$("wifiForm").onsubmit = (e) => { e.preventDefault(); wifiAdd(false); };
+$("wifiSaveJoin").onclick = () => { if ($("wifiForm").reportValidity()) wifiAdd(true); };
+setInterval(() => { if (!document.hidden) loadNetwork(); }, 20000);
+
+// ---------- settings ----------
+let settings = null;
+const setChanged = {};       // id -> new value, not saved yet
+function setRow(f) {
+  const row = el("div", "setrow"), id = "set-" + f.id.replace(".", "-");
+  const lab = el("label", "", f.label); lab.htmlFor = id; row.append(lab);
+  let input;
+  const changed = (value) => { setChanged[f.id] = value; row.classList.add("changed"); setDirty(); };
+  if (f.kind === "bool") {
+    input = el("input"); input.type = "checkbox"; input.checked = f.value; input.onchange = () => changed(input.checked);
+  } else if (f.kind === "choice") {
+    input = el("select");
+    for (const [v, text] of f.choices) { const o = el("option", "", text); o.value = v; input.append(o); }
+    input.value = f.value; input.onchange = () => changed(input.value);
+  } else if (f.kind === "password") {
+    const box = el("div", "pw");
+    input = el("input"); input.type = "password"; input.placeholder = f.is_set ? "set (type a new one to change it)" : "none";
+    input.oninput = () => { if (input.value) { off.checked = false; changed(input.value); } };
+    const offLab = el("label"), off = el("input"); off.type = "checkbox";
+    offLab.append(off, "No password");
+    off.onchange = () => { if (off.checked) { input.value = ""; changed(""); } else { delete setChanged[f.id]; setDirty(); } };
+    box.append(input); if (f.is_set) box.append(offLab);
+    input.id = id; row.append(box);
+    if (f.help) row.append(el("div", "help", f.help));
+    return row;
+  } else {
+    input = el("input"); input.type = ["int", "float"].includes(f.kind) ? "number" : "text";
+    if (f.min != null) input.min = f.min; if (f.max != null) input.max = f.max;
+    if (f.kind === "float") input.step = "0.5";
+    if (f.max_len) input.maxLength = f.max_len;
+    input.spellcheck = false; input.value = f.value;
+    if (f.locked) input.placeholder = "connect through the hotspot or USB cable to see";
+    input.oninput = () => changed(input.value);
+  }
+  input.id = id; input.disabled = !!f.locked; row.append(input);
+  if (f.help) row.append(el("div", "help", f.help));
+  return row;
+}
+function setDirty() {
+  const n = Object.keys(setChanged).length;
+  $("setSave").disabled = !n; $("setUndo").classList.toggle("hidden", !n);
+  $("setSave").textContent = n ? `Save ${n} change${n === 1 ? "" : "s"}` : "Save settings";
+  if (n) $("setMsg").textContent = "";
+}
+async function loadSettings(data) {
+  if (!data) { try { data = await api("/api/settings"); } catch (e) { return; } }
+  settings = data;
+  for (const k of Object.keys(setChanged)) delete setChanged[k];
+  const form = $("setForm"); form.replaceChildren();
+  for (const g of data.groups) {
+    const fs = el("fieldset"); fs.append(el("legend", "", g));
+    const fields = data.fields.filter((f) => f.group === g);
+    if (g === "Wi-Fi hotspot" && fields.some((f) => f.locked))
+      fs.append(el("p", "setnote", "To change these, connect through the hotspot or USB cable, or give this page a password first."));
+    else if (data.notes[g]) fs.append(el("p", "setnote", data.notes[g]));
+    for (const f of fields) fs.append(setRow(f));
+    form.append(fs);
+  }
+  $("setVersion").textContent = "Add-on " + data.version;
+  $("setMore").replaceChildren("Bluetooth delay: ", el("b", "", data.latency), " — to change it, run ",
+    el("code", "", "pirate-bluetooth latency low|normal|safe"), " on the Pi (it needs your password). Music folder: ",
+    el("code", "", data.music_dir), ". Everything else is in ", el("code", "", "~/.config/pirate-bluetooth/settings.ini"), ".");
+  setDirty();
+}
+$("setUndo").onclick = () => { loadSettings(settings); $("setMsg").textContent = ""; };
+$("setSave").onclick = async () => {
+  const out = $("setMsg"); out.className = ""; out.textContent = "Saving…"; $("setSave").disabled = true;
+  const newPassword = setChanged["upload.password"];
+  try {
+    const data = await api("/api/settings", { changes: setChanged });
+    const bits = [`Saved.`];
+    if (data.restarted.includes("pirate-bluetooth")) bits.push("The screen program restarts to use them.");
+    if (data.restarted.includes("pirate-network")) bits.push("The hotspot settings apply now (if it's on, phones on it join again with the new password).");
+    if (data.password) bits.push(newPassword ? "Your browser asks for the page's password next (any user name)."
+                                             : "The page has no password now.");
+    out.className = "ok-text"; out.textContent = bits.filter(Boolean).join(" ");
+    loadSettings(data.settings);
+    loadNetwork();
+  } catch (e) { out.className = "err"; out.textContent = e.message; $("setSave").disabled = false; }
+};
 
 // ---------- browsing and downloading ----------
 const ICONS = {
@@ -822,6 +1226,8 @@ if (/iPhone|iPad|iPod|Android/i.test(navigator.userAgent)) {
 refreshStatus().then((s) => { if (s && ["waiting", "running"].includes(s.scan.state)) watchScan(); });
 browse(fromHash(), "replace");
 loadPlaylists();
+loadNetwork();
+loadSettings();
 </script>
 </body>
 </html>

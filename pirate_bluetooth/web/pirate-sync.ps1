@@ -187,10 +187,27 @@ function Sync-Once($Watch, $Sent) {
 
 $watch = if ($Folders) { $Folders } else { Get-DefaultFolders }
 Write-Log ("Watching: " + ($watch -join "; ") + "  ->  $Pi")
-$sentSet = Get-Sent
+$piId = $null
+$sentSet = $null
 while ($true) {
-    $n = Sync-Once $watch $sentSet
-    if ($n -gt 0) { Write-Log "$n new file(s) sent to the Pi" }
+    try {
+        $st = Invoke-Pi "GET" "/api/status" $null
+        if ($st.Status -eq 401) { Write-Log "The music page needs a password: run this again with -Password" }
+        elseif ($st.Status -eq 200) {
+            # Each Pi set-up has its own id: a Pi on a fresh SD card gets a new one, so it's sent everything it
+            # doesn't have (the list of files done is kept per id).
+            $id = if ($st.Data -and $st.Data.pi_id) { [string]$st.Data.pi_id } else { "" }
+            if ($null -eq $sentSet -or $id -ne $piId) {
+                $piId = $id
+                $script:SentFile = if ($id) { Join-Path $AppDir "sent-$id.txt" } else { Join-Path $AppDir "sent.txt" }
+                $sentSet = Get-Sent
+            }
+            $n = Sync-Once $watch $sentSet
+            if ($n -gt 0) { Write-Log "$n new file(s) sent to the Pi" }
+        } else { Write-Log "The Pi answered $($st.Status); trying again later" }
+    } catch {
+        Write-Log "Can't reach the Pi at $Pi right now ($($_.Exception.Message)); trying again later"
+    }
     if ($Once) { break }
     Start-Sleep -Seconds $EverySeconds
 }

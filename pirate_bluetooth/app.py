@@ -11,6 +11,7 @@ Two ways to share the Pirate Audio with Pimoroni's Mopidy setup:
 
 import argparse
 import configparser
+import getpass
 import logging
 import os
 import signal
@@ -19,7 +20,7 @@ import time
 
 from gi.repository import GLib
 
-from . import __version__, mopidyconf
+from . import __version__, mopidyconf, network
 from .art import ArtLoader
 from .bluetooth import BluetoothClient
 from .menu import Item, Menu, Page, scroll_step
@@ -52,6 +53,9 @@ PRESS_RECONNECT_S = 30  # A pressed with no phone connected: keep trying this lo
 PLAY_WAIT_S = 12  # ...and send Play if the phone shows up within this long after it connects
 DAC_WAIT_S = 4  # how long to wait for the phone's audio to let go of the sound card
 ART_WAIT_S = 6  # the phone offers album art over Bluetooth: wait this long for it before looking online
+NET_SCREEN_S = 120  # "How to connect" stays up this long (time to scan its QR code with a phone)
+NET_CONFIRM_S = 6  # press A again within this long to really switch the hotspot on (it takes the Pi off Wi-Fi)
+NET_STARTING_S = 45  # "Starting…" until the network service says the hotspot is on
 REPEAT_LABELS = {"off": "Off", "all": "All", "one": "One song"}
 
 
@@ -116,6 +120,11 @@ class App:
         self.overlay = None
         self.overlay_until = 0.0
         self.info_until = 0.0
+        self.net = None  # what the network service (Wi-Fi, hotspot, USB cable) last said
+        self._net_mtime = None
+        self.net_until = 0.0  # the "How to connect" screen is up
+        self._net_confirm_until = 0.0
+        self._net_starting_until = 0.0
         self.last_activity = time.monotonic()
         self.asleep = False
 
@@ -163,6 +172,7 @@ class App:
                 log.info("Running the screen and buttons for Bluetooth and the Pi's music")
 
         self.menu = Menu()
+        self._read_net()
         self._swallow = None  # button whose press woke the screen
         self._repeats = {}  # button -> how many repeat events while held (menus scroll faster)
         music_dirs = [mopidyconf.get(mopidy_files, "local", "media_dir") or "~/Music"] if mopidy_files else ["~/Music"]
@@ -682,6 +692,9 @@ class App:
                 self.confirm = None
                 self.bt.answer(False)
                 self.toast("Pairing cancelled")
+        elif self.net_until > time.monotonic():  # "How to connect": A or B closes it (back to the menu)
+            if (name == "A" and kind == "short") or (name == "B" and kind == "press"):
+                self.net_until = 0.0
         elif info_open:
             if name == "A" and kind == "short":
                 self.info_until = 0.0
@@ -776,8 +789,137 @@ class App:
                 Item("Repeat", "action", action="repeat", value=REPEAT_LABELS[_repeat_mode(self.pi_state)]),
                 Item("Shuffle", "action", action="shuffle", value="On" if self.pi_state.get("random") else "Off"),
             ]
+        if self.net is not None:  # the network service is installed (not with install.sh --no-hotspot)
+            hotspot_on = bool((self.net.get("hotspot") or {}).get("active"))
+            items.append(Item("Wi-Fi hotspot", "dir", load=("network",), value="On" if hotspot_on else ""))
         items += [Item("Pair a new phone", "action", action="pair"), Item("Info", "action", action="info")]
         return items
+
+    # == Wi-Fi, the hotspot and the USB cable (the network service decides; the menu asks) ===============
+    def _read_net(self):
+        """Pick up network.json when it changed. Returns True if it did."""
+        try:
+            mtime = os.stat(network.STATUS_FILE).st_mtime
+        except OSError:
+            mtime = None
+        if mtime == self._net_mtime:
+            return False
+        self._net_mtime = mtime
+        before = self.net
+        self.net = network.read_status() if mtime else None
+        hs = (self.net or {}).get("hotspot") or {}
+        was_on = bool(((before or {}).get("hotspot") or {}).get("active"))
+        if hs.get("active") and not was_on and before is not None:
+            self._net_starting_until = 0.0
+            if hs.get("reason") == "auto":
+                log.info("No Wi-Fi: the hotspot came on by itself")
+                self.toast("No Wi-Fi, so the hotspot is on. Hold A › Wi-Fi hotspot")
+            self.wake()
+        elif before is not None and was_on and not hs.get("active"):
+            self.wake()
+        if self.menu.open and self.menu.page and self.menu.page.load == ("network",):
+            self.menu.page.set_items(self._network_items(), cursor=self.menu.page.cursor)
+        if self.menu.open and self.menu.stack[0].title == "Menu":
+            self._refresh_root()
+        return True
+
+    def _net_parts(self):
+        st = self.net or {}
+        return st, st.get("wifi") or {}, st.get("hotspot") or {}, st.get("usb") or {}
+
+    def _network_items(self):
+        st, wifi, hs, usb = self._net_parts()
+        if not st:
+            return []
+        now = time.monotonic()
+        if hs.get("active"):
+            value = "On"
+        elif self._net_confirm_until > now:
+            value = "Press A"
+        elif self._net_starting_until > now:
+            value = "Starting…"
+        else:
+            value = "Off"
+        if wifi.get("state") == "hotspot":
+            wifi_value = "Hotspot"
+        elif wifi.get("state") == "connected" and wifi.get("ssid"):
+            wifi_value = wifi["ssid"] if len(wifi["ssid"]) <= 12 else wifi["ssid"][:11] + "…"
+        else:
+            wifi_value = "None"
+        usb_value = ("Connected" if usb.get("connected") else "Ready") if usb.get("enabled") else "Off"
+        return [Item("Hotspot", "action", action="hotspot", value=value),
+                Item("Automatic", "action", action="hotspot_auto", value="On" if hs.get("auto") else "Off"),
+                Item("Wi-Fi", "action", action="net_info", value=wifi_value),
+                Item("USB cable", "action", action="net_info", value=usb_value),
+                Item("How to connect", "action", action="net_info")]
+
+    def open_network_page(self):
+        page = Page("Wi-Fi hotspot", load=("network",))
+        page.set_items(self._network_items())
+        if not page.items:
+            page.error = "The Wi-Fi part isn't running. Run install.sh again, or see: pirate-bluetooth logs network"
+        self.menu.push(page)
+
+    def _network_action(self, item, page):
+        _st, wifi, hs, _usb = self._net_parts()
+        now = time.monotonic()
+        if item.action == "hotspot":
+            if hs.get("active"):
+                network.request(hotspot=False)
+                self.toast("Hotspot off: the Pi looks for your Wi-Fi")
+            elif wifi.get("state") == "connected" and wifi.get("ssid") and self._net_confirm_until <= now:
+                self._net_confirm_until = now + NET_CONFIRM_S
+                self.toast(f"That takes the Pi off {wifi['ssid']}. Press A again to switch the hotspot on")
+            else:
+                self._net_confirm_until = 0.0
+                network.request(hotspot=True)
+                self._net_starting_until = now + NET_STARTING_S
+                self.net_until = now + NET_SCREEN_S  # show how to join it (with a QR code once it's on)
+        elif item.action == "hotspot_auto":
+            auto = not hs.get("auto")
+            network.request(auto=auto)
+            hs["auto"] = auto  # until the network service confirms
+            minutes = max(1, round(hs.get("after", 180) / 60))
+            self.toast(f"The hotspot comes on by itself after {minutes} min without Wi-Fi" if auto
+                       else "The hotspot only comes on from this menu now")
+        elif item.action == "net_info":
+            self.net_until = now + NET_SCREEN_S
+        page.set_items(self._network_items(), cursor=page.cursor)
+
+    def _net_view(self):
+        st, wifi, hs, usb = self._net_parts()
+        port = self.cfg.getint("upload", "port") if self.cfg.getboolean("upload", "enabled") else None
+        out = {"active": bool(hs.get("active")), "starting": self._net_starting_until > time.monotonic(),
+               "name": hs.get("name", ""), "password": hs.get("password", ""), "ip": hs.get("ip", network.HOTSPOT_IP),
+               "port": port, "user": getpass.getuser(), "clients": hs.get("clients", 0), "rows": []}
+        if not st:
+            out["rows"] = [("Wi-Fi", "not known (the network part isn't running)"), ("IP address", local_ip())]
+            return out
+        rows = out["rows"]
+        if wifi.get("state") == "connected" and wifi.get("ssid"):
+            ip = wifi.get("ip") or local_ip()
+            rows.append(("Wi-Fi", f"{wifi['ssid']} · {ip}"))
+            rows.append(("Music page", f"{ip}:{port}") if port else ("SSH", f"{out['user']}@{ip}"))
+        else:
+            rows.append(("Wi-Fi", "not connected" if wifi.get("state") != "missing" else "no Wi-Fi on this Pi"))
+        if hs.get("error"):
+            rows.append(("Hotspot", hs["error"]))
+        elif hs.get("auto"):
+            left = None
+            if wifi.get("state") != "connected" and st.get("no_wifi_since"):
+                left = max(hs.get("after", 180) - (time.time() - st["no_wifi_since"]),
+                           st.get("trying_until", 0) - time.time(), 0)
+            rows.append(("Hotspot", f"off · comes on by itself in {format_time(left)}" if left
+                         else "off · comes on after " + f"{max(1, round(hs.get('after', 180) / 60))} min without Wi-Fi"))
+        else:
+            rows.append(("Hotspot", "off · switch it on in this menu"))
+        if not usb.get("enabled"):
+            rows.append(("USB cable", "not set up (Trixie and install.sh)"))
+        elif usb.get("connected"):
+            rows.append(("USB cable", f"connected · {usb.get('ip') or network.USB_SHARED_IP}"))
+        else:
+            rows.append(("USB cable", f"plug a computer into {usb.get('port', 'the USB port')}"))
+        return out
 
     def open_menu(self):
         root = Page("Menu")
@@ -814,7 +956,11 @@ class App:
     def menu_select(self, item, page):
         if item is None:
             return
-        if item.kind == "dir":
+        if item.kind == "dir" and item.load == ("network",):
+            self.open_network_page()
+        elif item.action in ("hotspot", "hotspot_auto", "net_info"):
+            self._network_action(item, page)
+        elif item.kind == "dir":
             self.open_page(Page(item.label, load=item.load or ("browse", item.uri), icon=item.icon))
         elif item.kind == "track":
             tracks = [i for i in page.items if i.kind == "track"]
@@ -964,6 +1110,18 @@ class App:
         if self.info_until and now >= self.info_until:
             self.info_until = 0.0
             dirty = True
+        if self._read_net():
+            dirty = True
+        if self.net_until:
+            if now >= self.net_until:
+                self.net_until = 0.0
+            dirty = True  # countdowns on the "How to connect" screen
+        for until in ("_net_confirm_until", "_net_starting_until"):
+            if getattr(self, until) and now >= getattr(self, until):
+                setattr(self, until, 0.0)
+                if self.menu.open and self.menu.page and self.menu.page.load == ("network",):
+                    self.menu.page.set_items(self._network_items(), cursor=self.menu.page.cursor)
+                dirty = True
         if self.play_pending_until and now >= self.play_pending_until:
             self.play_pending_until = 0.0
             if self.phone:
@@ -980,7 +1138,7 @@ class App:
         if self.pi:  # look at Mopidy often only while its music is (or its menu is) on a lit screen
             self.pi.fast = (self.source == "pi" or self.menu.open) and not self.asleep
         # Stay lit while waiting for the first press after power-on: a press on a dark screen only wakes it.
-        busy = self.music_playing() or self.pairing or self.confirm or self.boot_hold_until
+        busy = self.music_playing() or self.pairing or self.confirm or self.boot_hold_until or self.net_until
         if (self.hw_owned and not self.asleep and self.sleep_after > 0 and not busy
                 and now - self.last_activity > self.sleep_after):
             log.info("Screen off (idle)")
@@ -1023,9 +1181,11 @@ class App:
                                              else "nothing" if self.present else "Bluetooth is off")),
                 ("Paired phones", ", ".join(self.paired) if self.paired else "none yet"),
                 ("Headphone volume", f"{vol}%" if vol is not None else "not ready"),
-                (("Add music at", f"{local_ip()}:{self.cfg.getint('upload', 'port')}")
-                 if self.cfg.getboolean("upload", "enabled") else ("IP address", local_ip())),
+                self._reach_row(),
             ]
+        elif self.net_until > now:
+            view.kind = "network"
+            view.net = self._net_view()
         elif self.pairing:
             view.kind = "pairing"
             left = max(0, int(self.bt.pairing_until - now))
@@ -1059,6 +1219,16 @@ class App:
         else:
             view.kind = "idle"
         return view
+
+    def _reach_row(self):
+        """The Info screen's last line: where to add music (or the hotspot, while it's on)."""
+        _st, wifi, hs, _usb = self._net_parts()
+        if hs.get("active"):
+            return ("Hotspot on", f"{hs.get('name', '')} · {hs.get('ip', network.HOTSPOT_IP)}")
+        ip = wifi.get("ip") or local_ip()
+        if self.cfg.getboolean("upload", "enabled"):
+            return ("Add music at", f"{ip}:{self.cfg.getint('upload', 'port')}")
+        return ("IP address", ip)
 
     def _pi_view(self, view, now):
         st = self.pi_state

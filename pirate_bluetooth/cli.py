@@ -6,8 +6,10 @@ its own pairing agent, which would take the code-confirmation step away from the
 
 import argparse
 import configparser
+import getpass
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -15,7 +17,7 @@ import time
 
 from gi.repository import Gio, GLib
 
-from . import mopidyconf
+from . import mopidyconf, network
 from .system import restart_mopidy_keeping_queue
 from .upload import _mopidy_execstart, mopidy_config_files, mopidy_library_enabled
 
@@ -149,11 +151,12 @@ LOG_PARTS = {
     "upload": [("_SYSTEMD_USER_UNIT", "pirate-upload.service")],
     "audio": [("_SYSTEMD_UNIT", "pirate-bluealsa.service"), ("_SYSTEMD_UNIT", "pirate-bluealsa-aplay.service")],
     "mopidy": [("_SYSTEMD_USER_UNIT", "mopidy.service")],
+    "network": [("_SYSTEMD_USER_UNIT", "pirate-network.service")],
 }
 
 
 def cmd_logs(args):
-    parts = [args.part] if args.part else ["screen", "upload", "audio"]
+    parts = [args.part] if args.part else ["screen", "upload", "audio", "network"]
     matches = []
     for part in parts:
         for field, unit in LOG_PARTS[part]:
@@ -251,6 +254,130 @@ def cmd_status(bz, _args):
     port = upload_port()
     where = f" - http://{socket.gethostname()}.local:{port}" if state == "active" else ""
     print(f"{'Music page:':<23}{state}{where}")
+    for label, value in network_lines():
+        print(f"{label + ':':<23}{value}")
+
+
+# == Wi-Fi, the hotspot and the USB cable ===========================================================
+def network_lines():
+    """What `pirate-bluetooth status` says about how to reach the Pi."""
+    st = network.read_status()
+    if not st:
+        active = _run(["systemctl", "--user", "is-active", "pirate-network"])[1] or "not installed"
+        return [("Wi-Fi hotspot", f"the network part isn't running ({active}); see: pirate-bluetooth logs network")]
+    wifi, hs, usb = st.get("wifi") or {}, st.get("hotspot") or {}, st.get("usb") or {}
+    out = []
+    if wifi.get("state") == "connected" and wifi.get("ssid"):
+        out.append(("Wi-Fi", f"{wifi['ssid']} ({wifi.get('ip', '')})"))
+    elif wifi.get("state") != "hotspot":
+        out.append(("Wi-Fi", "not connected"))
+    if hs.get("active"):
+        out.append(("Wi-Fi hotspot", f"ON: \"{hs.get('name')}\", password {hs.get('password')}, the Pi is {hs.get('ip')}"
+                    + (f" ({hs['clients']} connected)" if hs.get("clients") else "")))
+    else:
+        after = max(1, round(hs.get("after", 180) / 60))
+        out.append(("Wi-Fi hotspot", f"off (comes on by itself after {after} min without Wi-Fi)" if hs.get("auto")
+                    else "off (only from the menu or: pirate-bluetooth hotspot on)"))
+    if hs.get("error"):
+        out.append(("Hotspot problem", hs["error"]))
+    if usb.get("enabled"):
+        out.append(("USB cable", f"connected ({usb.get('ip') or network.USB_SHARED_IP})" if usb.get("connected")
+                    else f"ready: plug a computer into {usb.get('port')}"))
+    return out
+
+
+def _wait_for(test, seconds):
+    end = time.time() + seconds
+    while time.time() < end:
+        st = network.read_status() or {}
+        if test(st):
+            return st
+        time.sleep(1)
+    return None
+
+
+def cmd_hotspot(args):
+    st = network.read_status()
+    if args.action and not st:
+        sys.exit("The add-on's network part isn't running (systemctl --user status pirate-network).")
+    if args.action == "on":
+        wifi = (st.get("wifi") or {})
+        if wifi.get("state") == "connected" and os.environ.get("SSH_CONNECTION") and sys.stdin.isatty():
+            answer = input(f"This takes the Pi off {wifi.get('ssid')}, which ends this SSH session. Go ahead? [y/N] ")
+            if not answer.lower().startswith("y"):
+                return
+        network.request(hotspot=True)
+        print("Switching the hotspot on…")
+        st = _wait_for(lambda s: (s.get("hotspot") or {}).get("active") or (s.get("hotspot") or {}).get("error"), 45) or st
+    elif args.action == "off":
+        network.request(hotspot=False)
+        print("Hotspot off: the Pi looks for your Wi-Fi.")
+        st = _wait_for(lambda s: not (s.get("hotspot") or {}).get("active"), 20) or st
+    elif args.action in ("auto-on", "auto-off"):
+        network.request(auto=args.action == "auto-on")
+        st = _wait_for(lambda s: (s.get("hotspot") or {}).get("auto") == (args.action == "auto-on"), 10) or st
+    if not st:
+        sys.exit("The add-on's network part isn't running (systemctl --user status pirate-network).")
+    hs = st.get("hotspot") or {}
+    for label, value in network_lines():
+        print(f"{label + ':':<17}{value}")
+    if not hs.get("active"):
+        print(f"{'Name, password:':<17}\"{hs.get('name')}\", {hs.get('password')} (settings.ini [wifi] changes them)")
+    print()
+    port = upload_port()
+    print(f"While it's on: join the Wi-Fi \"{hs.get('name')}\" on your phone or computer, then open")
+    print(f"http://{hs.get('ip', network.HOTSPOT_IP)}:{port} (the music page, where you can add a Wi-Fi) or: "
+          f"ssh {getpass.getuser()}@{hs.get('ip', network.HOTSPOT_IP)}")
+    print("Change it:  pirate-bluetooth hotspot on|off|auto-on|auto-off")
+
+
+def cmd_wifi(args):
+    nm = network.Nm()
+    try:
+        if args.action == "add":
+            if not args.name:
+                sys.exit('Which Wi-Fi? pirate-bluetooth wifi add "Name" [password]')
+            password = args.password if args.password is not None else getpass.getpass(
+                f"Password for {args.name} (empty for an open network): ")
+            if password and not 8 <= len(password) <= 63:
+                sys.exit("Wi-Fi passwords are 8 to 63 characters.")
+            seen = {w["ssid"]: w for w in nm.wifi_list()}
+            uuid = nm.add_wifi(args.name, password, device=(nm.wifi_device() or {}).get("device", ""),
+                               security=seen.get(args.name, {}).get("security", ""), hidden=args.name not in seen)
+            print(f"Saved {args.name}. The Pi joins it by itself when it's in range"
+                  + (" (it isn't right now)." if args.name not in seen else "."))
+            if args.join:
+                network.request(join=uuid)
+                print("Switching to it now…")
+            return
+        saved = nm.saved_wifi()
+        if args.action in ("forget", "join"):
+            match = [w for w in saved if args.name in (w["ssid"], w["name"])]
+            if not match:
+                sys.exit(f"No saved Wi-Fi called {args.name!r}. Saved: " + (", ".join(w["ssid"] for w in saved) or "none"))
+            if args.action == "forget":
+                nm.forget(match[0]["uuid"])
+                print(f"Forgot {match[0]['ssid']}.")
+            else:
+                network.request(join=match[0]["uuid"])
+                print(f"Switching to {match[0]['ssid']}… (if this is an SSH session over Wi-Fi, it ends now)")
+            return
+        st = network.read_status() or {}
+        current = (st.get("wifi") or {}).get("ssid")
+        print("Saved Wi-Fi networks (the Pi joins whichever is in range):")
+        for w in saved:
+            print(f"  {'*' if w['ssid'] == current else ' '} {w['ssid']}" + ("" if w["autoconnect"] else "  (not automatic)"))
+        if not saved:
+            print("  none")
+        try:
+            around = nm.wifi_list()
+        except network.NmError:
+            around = []
+        if around:
+            print("In range now: " + ", ".join(f"{w['ssid']} ({w['signal']}%)" for w in around[:12]))
+        print('Add one:  pirate-bluetooth wifi add "Name"   (forget/join "Name" too)')
+    except network.NmError as err:
+        sys.exit(f"Wi-Fi: {err}")
 
 
 def cmd_pair(bz, args):
@@ -437,6 +564,17 @@ def cmd_doctor(_args):
         for ln in problems[-6:]:
             print("  " + ln[:200])
 
+    net_state = _run(["systemctl", "--user", "is-active", "pirate-network"])[1] or "unknown"
+    if net_state != "active":
+        line("Wi-Fi hotspot part", net_state, "Start it: systemctl --user restart pirate-network (or run install.sh again)")
+    elif not os.path.exists(f"{ROOT}/etc/polkit-1/rules.d/50-pirate-bluetooth-hotspot.rules"):
+        line("Hotspot permission", "missing", "Run install.sh again (it lets the add-on switch the hotspot)")
+    elif not shutil.which("dnsmasq"):
+        line("dnsmasq", "missing (the hotspot needs it)", "sudo apt install dnsmasq-base")
+    else:
+        hs = ((network.read_status() or {}).get("hotspot") or {})
+        line("Wi-Fi hotspot", "on" if hs.get("active") else ("ready" if not hs.get("error") else hs["error"]))
+
     print()
     if fixes:
         print("What to do:")
@@ -505,12 +643,19 @@ def main(argv=None):
     sub.add_parser("doctor", help="find out why the screen or buttons aren't working")
     st = sub.add_parser("screen-test", help="draw a test picture and show button presses")
     st.add_argument("seconds", nargs="?", type=float, default=15)
+    hs = sub.add_parser("hotspot", help="show or switch the Pi's own Wi-Fi hotspot (for when it can't join yours)")
+    hs.add_argument("action", nargs="?", choices=["on", "off", "auto-on", "auto-off"])
+    wf = sub.add_parser("wifi", help="list, add, forget or join the Wi-Fi networks the Pi uses")
+    wf.add_argument("action", nargs="?", choices=["list", "add", "forget", "join"], default="list")
+    wf.add_argument("name", nargs="?")
+    wf.add_argument("password", nargs="?")
+    wf.add_argument("--join", action="store_true", help="(add) switch to it right away")
     args = parser.parse_args(argv)
 
     # These don't need Bluetooth itself
-    if args.cmd in ("latency", "logs", "library", "doctor", "screen-test"):
+    if args.cmd in ("latency", "logs", "library", "doctor", "screen-test", "hotspot", "wifi"):
         {"latency": cmd_latency, "logs": cmd_logs, "library": cmd_library, "doctor": cmd_doctor,
-         "screen-test": cmd_screen_test}[args.cmd](args)
+         "screen-test": cmd_screen_test, "hotspot": cmd_hotspot, "wifi": cmd_wifi}[args.cmd](args)
         return
 
     try:

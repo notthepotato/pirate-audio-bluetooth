@@ -9,12 +9,16 @@ name and only renamed into place once complete, so Mopidy never sees half-writte
 
 The same page browses the Music folder and downloads single songs, or whole folders (or everything) as
 a .zip that's put together while it downloads (stored, not compressed: music files don't shrink).
+
+It also gets songs from SoundCloud links (the files artists offer for download, see soundcloud.py) and,
+when you're connected through the Pi's hotspot or USB cable, sets up the Wi-Fi networks the Pi uses.
 """
 
 import argparse
 import base64
 import configparser
 import hmac
+import ipaddress
 import json
 import logging
 import mimetypes
@@ -32,7 +36,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import mopidyconf, playlist, playsync
+from . import __version__, mopidyconf, network, playlist, playsync, settingsfile, soundcloud
 
 log = logging.getLogger("pirate_upload")
 
@@ -44,6 +48,8 @@ REFUSED = {
 }
 CHUNK = 1024 * 1024
 DRAIN_LIMIT = 16 * 1024 * 1024  # on a refusal, read up to this much so the browser gets the reason
+MAX_SC_BATCH = 500  # SoundCloud songs per "download these"
+LATENCY_FILE = os.environ.get("PIRATE_TEST_ROOT", "") + "/etc/default/pirate-bluetooth-latency"
 WEB_DIR = Path(__file__).with_name("web")
 
 DEFAULTS = {
@@ -481,6 +487,13 @@ class Handler(BaseHTTPRequestHandler):
     registry: playsync.Registry = None  # playlists kept in sync, with their icons
     syncer: playsync.Syncer = None
     checked = {}  # playlist id -> the last check's Apple data (so saving doesn't ask Apple again)
+    sc_client: soundcloud.Client = None
+    sc_account: soundcloud.Account = None
+    sc_downloads: soundcloud.Downloads = None
+    sc_seen = {}  # SoundCloud track id -> what the last checks found (downloads only take songs from these)
+    nm: network.Nm = None
+    settings_path = settingsfile.SETTINGS
+    pi_id = ""  # this set-up of the Pi (new after a fresh SD card), so the PC helper knows what it already sent
 
     def log_message(self, fmt, *args):
         log.debug("%s %s", self.address_string(), fmt % args)
@@ -553,6 +566,12 @@ class Handler(BaseHTTPRequestHandler):
                                            for e in self.registry.all() if e.get("missing")]})
         elif path == "/pirate-sync.ps1":
             self._send_sync_script()
+        elif path == "/api/soundcloud/jobs":
+            self._send(200, {"jobs": self.sc_downloads.status(), "user": self.sc_account.user()})
+        elif path == "/api/network":
+            self._send(200, self._network_info())
+        elif path == "/api/settings":
+            self._send(200, self._settings_info())
         elif path in ("/api/browse", "/api/download", "/api/zip"):
             query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             raw_path = (query.get("path") or [""])[0]
@@ -576,6 +595,7 @@ class Handler(BaseHTTPRequestHandler):
                 "recent": library["recent"],
                 "scan": self.scanner.status(),
                 "iris_port": self.iris_port,
+                "pi_id": self.pi_id,
                 "audio": sorted(AUDIO_EXTS),
                 "extra": sorted(EXTRA_EXTS),
                 "refused": REFUSED,
@@ -728,6 +748,35 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/scan":
             self.scanner.request(delay=0)
             self._send(202, self.scanner.status())
+        elif path == "/api/settings":
+            try:
+                result = self._settings_save(self._json_body())
+            except UploadError as err:
+                self._send(err.status, {"error": err.message})
+            except settingsfile.SettingsError as err:
+                self._send(400, {"error": str(err)})
+            except OSError as err:
+                self._send(500, {"error": f"Couldn't save the settings: {err.strerror or err}"})
+            else:
+                self._send(200, result)
+        elif path.startswith(("/api/soundcloud/", "/api/network/", "/api/wifi/")):
+            try:
+                body = self._json_body()
+                if path.startswith("/api/soundcloud/"):
+                    result = self._soundcloud(path.rsplit("/", 1)[-1], body)
+                else:
+                    result = self._network_action(path, body)
+            except UploadError as err:
+                self._send(err.status, {"error": err.message})
+            except soundcloud.SoundCloudError as err:
+                self._send(400, {"error": str(err), "code": err.code})
+            except network.NmError as err:
+                self._send(400, {"error": f"Wi-Fi: {err}"})
+            except Exception:
+                log.exception("%s failed", path)
+                self._send(500, {"error": "Something went wrong on the Pi; `pirate-bluetooth logs upload` has details."})
+            else:
+                self._send(200, result)
         elif path in ("/api/playlist/check", "/api/playlist/save") or path.startswith("/api/playlists/"):
             try:
                 body = self._json_body()
@@ -858,6 +907,155 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, {"error": "No icon"})
         self._send(200, data, "image/jpeg")
 
+    # -- SoundCloud --
+    def _soundcloud(self, action, body):
+        if action == "check":
+            url = soundcloud.canonical(soundcloud.find_link(str(body.get("url", ""))[:2000]))
+            found = self.sc_client.resolve(url)
+            tracks = [soundcloud.summarize(t) for t in found["tracks"]]
+            rows = playlist.match([{"title": t["title"], "artist": t["artist"], "album": "", "duration": t["duration"],
+                                    "id": ""} for t in tracks], self.index.entries())
+            if len(Handler.sc_seen) > 3000:
+                Handler.sc_seen.clear()
+            for t, row in zip(tracks, rows):
+                t["on_pi"] = row["match"]["path"] if row["status"] == "on_pi" else ""
+                close = [c for c in row["candidates"] if c["score"] >= 0.75] if row["status"] == "choose" else []
+                t["maybe"] = close[0]["path"] if close else ""
+                q = urllib.parse.quote(f"{t['artist']} {playlist.split_title(t['title'])[0]}".strip())
+                t["bandcamp"] = f"https://bandcamp.com/search?q={q}&item_type=t"
+                Handler.sc_seen[t["id"]] = t
+            log.info("SoundCloud link %s: %d songs, %d offered for download", url, len(tracks),
+                     sum(1 for t in tracks if t["downloadable"]))
+            return {"kind": found["kind"], "title": found["title"], "url": url, "tracks": tracks,
+                    "user": self.sc_account.user(), "jobs": self.sc_downloads.status()}
+        if action == "download":
+            wanted = [self.sc_seen.get(int(i)) for i in (body.get("ids") or [])[:MAX_SC_BATCH] if str(i).isdigit()]
+            wanted = [t for t in wanted if t and t["downloadable"]]
+            if not wanted:
+                raise UploadError(400, "None of those songs can be downloaded (look the link up again?).")
+            if not self.sc_account.token():
+                raise soundcloud.SoundCloudError("Sign in to SoundCloud first (below).", code="signin")
+            added = self.sc_downloads.add(wanted)
+            return {"added": added, "jobs": self.sc_downloads.status()}
+        if action == "signin":
+            token = soundcloud.clean_token(str(body.get("token", ""))[:400])
+            user = self.sc_client.me(token)
+            self.sc_account.save(token, user)
+            log.info("Signed in to SoundCloud as %s", user)
+            return {"user": user}
+        if action == "signout":
+            self.sc_account.clear()
+            return {"user": ""}
+        raise UploadError(404, "Not found")
+
+    # -- the Settings card --
+    def _settings_info(self):
+        info = settingsfile.describe(self.settings_path, may_change_wifi=self._may_change_network())
+        latency = "normal"
+        try:
+            with open(LATENCY_FILE, encoding="utf-8") as fh:
+                latency = next((ln.split("=", 1)[1].strip() for ln in fh if ln.startswith("PIRATE_LATENCY=")), latency)
+        except OSError:
+            latency = "safe"
+        info.update(version=__version__, latency=latency, music_dir=str(self.store.root).replace(os.path.expanduser("~"), "~", 1))
+        return info
+
+    def _settings_save(self, body):
+        changes = settingsfile.validate(body.get("changes") or {}, may_change_wifi=self._may_change_network())
+        if not changes:
+            raise UploadError(400, "Nothing to save.")
+        services = settingsfile.write(changes, self.settings_path)
+        log.info("Settings changed on the music page: %s", ", ".join(f"{s}.{k}" for s, k in changes))
+        if ("upload", "password") in changes:
+            Handler.password = changes[("upload", "password")]
+        if ("upload", "sync_hours") in changes:
+            self.syncer.sync_hours = max(0.5, float(changes[("upload", "sync_hours")]))
+        for unit in sorted(services):  # only if it's running: try-restart doesn't start a stopped service
+            subprocess.Popen(["systemctl", "--user", "try-restart", unit], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        return {"saved": len(changes), "restarted": sorted(services),
+                "password": ("upload", "password") in changes, "settings": self._settings_info()}
+
+    # -- Wi-Fi, the hotspot, the USB cable --
+    def _on_local_link(self):
+        """Is this browser connected through the Pi's own hotspot or USB cable (or is this the Pi itself)?
+        Only then (or with a page password) can the page change the Pi's Wi-Fi: someone else on a shared
+        network shouldn't be able to switch the Pi to a different one."""
+        try:
+            ip = ipaddress.ip_address(self.client_address[0].removeprefix("::ffff:"))
+        except ValueError:
+            return False
+        if ip.is_loopback:
+            return True
+        st = network.read_status() or {}
+        if (st.get("hotspot") or {}).get("active") and ip in ipaddress.ip_network(f"{network.HOTSPOT_IP}/24", strict=False):
+            return True
+        usb = st.get("usb") or {}
+        if usb.get("ip") and usb.get("prefix"):
+            try:
+                return ip in ipaddress.ip_network(f"{usb['ip']}/{usb['prefix']}", strict=False)
+            except ValueError:
+                pass
+        return False
+
+    def _may_change_network(self):
+        return bool(self.password) or self._on_local_link()
+
+    def _network_info(self):
+        st = network.read_status()
+        out = {"status": st, "saved": [], "around": [], "can_change": self._may_change_network(),
+               "local": self._on_local_link(), "error": ""}
+        if not st:
+            out["error"] = "The Wi-Fi part of the add-on isn't running (pirate-bluetooth logs network)."
+        try:
+            out["saved"] = self.nm.saved_wifi()
+            if st and (st.get("wifi") or {}).get("state") == "hotspot":
+                out["around"] = st.get("scan") or []  # a hotspot can't look around: what it saw before
+            else:
+                out["around"] = [{k: w[k] for k in ("ssid", "signal", "security")} for w in self.nm.wifi_list()]
+        except network.NmError as err:
+            out["error"] = out["error"] or f"Wi-Fi: {err}"
+        return out
+
+    def _network_action(self, path, body):
+        if not self._may_change_network():
+            raise UploadError(403, "To change the Pi's Wi-Fi from here, connect through its hotspot or USB cable, "
+                                   "or set a password for this page (settings.ini, [upload] password).")
+        if path == "/api/network/hotspot":
+            network.request(hotspot=bool(body.get("on")))
+        elif path == "/api/network/auto":
+            network.request(auto=bool(body.get("auto")))
+        elif path == "/api/wifi/scan":
+            network.request(scan=True)
+        elif path == "/api/wifi/add":
+            ssid = str(body.get("ssid", "")).strip()
+            password = str(body.get("password", ""))
+            if not 1 <= len(ssid.encode("utf-8")) <= 32:
+                raise UploadError(400, "Type the Wi-Fi's name (32 characters at most).")
+            if password and not 8 <= len(password) <= 63:
+                raise UploadError(400, "Wi-Fi passwords are 8 to 63 characters (or none, for an open Wi-Fi).")
+            st = network.read_status() or {}
+            around = st.get("scan") or []
+            if (st.get("wifi") or {}).get("state") != "hotspot":
+                try:
+                    around = self.nm.wifi_list()
+                except network.NmError:
+                    pass
+            seen = {w["ssid"]: w for w in around}
+            device = (st.get("wifi") or {}).get("device", "")
+            uuid = self.nm.add_wifi(ssid, password, device=device, security=seen.get(ssid, {}).get("security", ""),
+                                    hidden=ssid not in seen)
+            log.info("Saved the Wi-Fi %s (from the music page)", ssid)
+            if body.get("join"):
+                network.request(join=uuid)
+        elif path == "/api/wifi/forget":
+            self.nm.forget(str(body.get("uuid", "")))
+        elif path == "/api/wifi/join":
+            network.request(join=str(body.get("uuid", "")))
+        else:
+            raise UploadError(404, "Not found")
+        return self._network_info()
+
     def _send_sync_script(self):
         """The PC helper that uploads new music by itself, with this Pi's address filled in."""
         host = self.headers.get("Host") or f"{socket.gethostname()}.local:{self.server.server_port}"
@@ -874,8 +1072,27 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
 
+def install_id(path=os.path.expanduser("~/.local/state/pirate-bluetooth/install-id")):
+    """A random id made once per set-up of the Pi (a fresh SD card gets a new one)."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            value = fh.read().strip()
+        if re.fullmatch(r"[0-9a-f]{16}", value):
+            return value
+    except OSError:
+        pass
+    value = os.urandom(8).hex()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(value + "\n")
+    except OSError:
+        pass
+    return value
+
+
 def load_config(path):
-    cfg = configparser.ConfigParser()
+    cfg = configparser.ConfigParser(interpolation=None)  # a password may have a % in it
     cfg.read_dict(DEFAULTS)
     if path and os.path.exists(path):
         cfg.read(path)
@@ -931,6 +1148,19 @@ def main(argv=None):
     Handler.syncer = playsync.Syncer(Handler.registry, Handler.index, Handler.picks, Handler.rpc,
                                      str(Handler.store.root), sync_hours=max(0.5, up.getfloat("sync_hours")))
     Handler.syncer.start()
+
+    def library_changed():  # a SoundCloud download finished: same as an upload
+        Handler.store._recent_cache = (0.0, None)
+        Handler.scanner.request()
+        Handler.index.invalidate()
+        Handler.syncer.library_changed()
+    Handler.sc_client = soundcloud.Client()
+    Handler.sc_account = soundcloud.Account()
+    Handler.sc_downloads = soundcloud.Downloads(Handler.sc_client, Handler.sc_account, up.get("music_dir"),
+                                                up.getint("keep_free_mb") * 2**20, on_saved=library_changed)
+    Handler.nm = network.Nm()
+    Handler.pi_id = install_id()
+    Handler.settings_path = args.config
     port = args.port or up.getint("port")
 
     server = ThreadingHTTPServer((args.bind, port), Handler)

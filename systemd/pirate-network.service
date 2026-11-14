@@ -1,0 +1,14 @@
+[Unit]
+Description=Pirate Audio Wi-Fi hotspot (when the Pi can't join your Wi-Fi) and network status for the screen
+Documentation=file://%h/.local/share/pirate-bluetooth/README.md
+
+[Service]
+Type=simple
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=%h/.local/share/pirate-bluetooth
+ExecStart=/usr/bin/python3 -m pirate_bluetooth.network
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

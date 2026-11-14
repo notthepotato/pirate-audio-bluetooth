@@ -1,0 +1,17 @@
+# Installed by the Pirate Audio Bluetooth add-on (removed by its uninstall.sh).
+# A power cut while the Pi saves a Wi-Fi setting can leave an empty file in /etc/netplan, and then the Pi may
+# not join any Wi-Fi after the next boot. This moves empty files out of the way before NetworkManager starts.
+[Unit]
+Description=Move empty network settings files out of the way (Pirate Audio add-on)
+DefaultDependencies=no
+After=local-fs.target
+Before=NetworkManager.service network-pre.target
+Wants=network-pre.target
+ConditionDirectoryNotEmpty=/etc/netplan
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/pirate-bluetooth/netplan-check
+
+[Install]
+WantedBy=multi-user.target

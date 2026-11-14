@@ -14,8 +14,14 @@ between your phone and the Pi's music.
 It also adds a **music page** for your PC or phone: open `http://raspberrypi.local:6681`, drop songs or whole
 album folders on it, and they go straight into the Pi's Music folder, ready to play in Mopidy. The same page
 lets you **download music from the Pi** back to your computer (single songs, whole folders, or everything),
-and **check an Apple Music playlist**: which of its songs are already on the Pi, with a choice when it isn't
-clear, saved as a playlist for the Pi.
+**check an Apple Music playlist**: which of its songs are already on the Pi, with a choice when it isn't
+clear, saved as a playlist for the Pi. Paste a **SoundCloud link** and songs whose artist offers a download
+come straight to the Pi. A **Settings** card changes the add-on's settings without SSH.
+
+**You can always get back in.** If the Pi can't join a Wi-Fi it knows (you're somewhere new, or the Wi-Fi
+settings got damaged), it makes **its own Wi-Fi hotspot** after 3 minutes, or when you pick it in the menu.
+Join it from your phone or laptop (the screen shows a QR code your iPhone's camera can join), then SSH in or
+open the music page and add the Wi-Fi. On Trixie a **USB cable** to a computer works too.
 
 **One script installs everything**, on Raspberry Pi OS **Trixie** or **Bookworm** (it works out which one it's
 on). On a fresh SD card it also sets up the Pi's music player (Mopidy with the Iris web page), so you don't
@@ -59,13 +65,18 @@ What it checks and sets up:
   playing from `~/Music`. It's Mopidy 3.4 rather than the brand-new Mopidy 4 because Iris doesn't work with
   Mopidy 4 yet. On Trixie the installer also applies a small fix Mopidy 3.4 needs there (from Mopidy 4).
 - **On Trixie: album art from your phone over Bluetooth** (BlueZ's cover-art support and `bluez-obexd`).
+- **A way in when there's no Wi-Fi:** the Wi-Fi hotspot (all Pis with NetworkManager, i.e. Bookworm and
+  Trixie) and, on Trixie with a Pi Zero, 4 or 5, a network over a USB cable (Raspberry Pi's own
+  `rpi-usb-gadget`). It also turns off Wi-Fi power saving (it can make a Pi drop off Wi-Fi and stay off) and,
+  on Trixie, moves empty network settings files aside at boot (a power cut while saving one can stop the Pi
+  joining any Wi-Fi).
 - Bluetooth audio, the screen and buttons, the music page, and starting everything at power-on.
 
 Options: `--name "…"`, `--y-pin 20` for early boards, `--upload-port 8090` if port 6681 is taken,
 `--no-upload` to skip the music page, `--latency low` for less audio delay (see below),
 `--keep-pimoroni-screen` (see above), `--no-mopidy` (Bluetooth only: don't install Mopidy on a Pi that
-doesn't have it), `--no-phone-art` (don't set up album art over Bluetooth). Running `install.sh` again
-updates the add-on and keeps your settings.
+doesn't have it), `--no-phone-art` (don't set up album art over Bluetooth), `--no-hotspot` and `--no-usb`.
+Running `install.sh` again updates the add-on and keeps your settings.
 
 Nothing is compiled: Raspberry Pi OS packages, plus Mopidy and Iris from the Python package index the way
 Pimoroni installs them. The install takes a few minutes (a bit longer when it sets up Mopidy).
@@ -77,10 +88,12 @@ Pimoroni installs them. The install takes a few minutes (a bit longer when it se
    click *Download all* (see below). Or copy it from your PC with `scp -r pi@raspberrypi.local:~/Music .`
    (use your user name and Pi name).
 2. Flash **Raspberry Pi OS Lite** (Trixie is the current version) with Raspberry Pi Imager. In its
-   settings, set the user name, Wi-Fi and SSH so you can log in.
+   settings, set the user name, Wi-Fi and SSH so you can log in. A Pi Zero 2 W only sees 2.4 GHz Wi-Fi.
 3. Copy this folder onto the Pi and run `bash install.sh` as above. No need for Pimoroni's installer.
 4. After the reboot, pair your phone again (the new system doesn't know it) and drop your music back on the
-   music page.
+   music page. Check and save your Apple Music playlists again. If you use the PC helper, download it again
+   from the music page and run its `-Install` line once: this version notices a fresh Pi and sends it all the
+   songs it doesn't have (older versions remembered what they'd sent before and skipped those).
 
 ## Pair your phone (once)
 
@@ -92,6 +105,36 @@ Pimoroni installs them. The install takes a few minutes (a bit longer when it se
 After that it works like headphones. When you switch the Pi on, it connects to your iPhone by itself: it keeps
 trying for 3 minutes, so it's fine if the phone is still in your pocket or asleep. You can also pick
 **Pirate Audio** in Control Center at any time. Plug your headphones into the Pirate Audio and play.
+
+## When you can't reach the Pi: the hotspot and the USB cable
+
+![Hotspot screens](docs/hotspot.png)
+
+**The Wi-Fi hotspot.** The Pi makes its own Wi-Fi, so your phone or laptop can always reach it:
+
+- **By itself:** after 3 minutes without a Wi-Fi it knows (after power-on, or when your Wi-Fi goes away). The
+  screen says so. While nobody is connected to it, it looks for your Wi-Fi again every 5 minutes, and goes
+  off once the Pi is back on your Wi-Fi.
+- **From the menu:** hold **A** → **Wi-Fi hotspot** → **Hotspot**. If the Pi is on a Wi-Fi, press **A**
+  twice (it leaves that Wi-Fi). **Automatic** switches the by-itself part on or off.
+- **How to connect** shows its name and password, and a **QR code**: point your iPhone's camera at it and
+  tap *Join*. Then open **`http://10.42.0.1:6681`** (the music page) or `ssh you@10.42.0.1`.
+- On the music page's **Wi-Fi and hotspot** card you can then add the Wi-Fi the Pi should use (pick it from
+  the list of networks around, type the password, *Save and switch to it*). The hotspot goes off and the Pi
+  joins it; if the password was wrong, the hotspot comes back within a minute so you can try again.
+- Phones on the hotspot keep their mobile data for the internet (the Pi doesn't offer them a way out), so
+  your iPhone doesn't lose the internet while it's joined.
+- The name is the Bluetooth name (*Pirate Audio*), and the installer makes up a password. Change either in
+  **Settings** on the music page. Over SSH: `pirate-bluetooth hotspot` (and `hotspot on|off`).
+
+**The USB cable (Raspberry Pi OS Trixie; Pi Zero, Zero 2 W, 4 or 5).** The installer switches on Raspberry
+Pi's own USB networking (`rpi-usb-gadget`). Plug a computer into the Pi's **USB** port (on a Zero: the
+micro-USB port marked *USB*, not *PWR IN*; on a Pi 4/5: the USB-C port), wait a minute, then
+`ssh you@raspberrypi.local` or `ssh you@10.12.194.1`, or open `http://10.12.194.1:6681`. On Windows, install
+Raspberry Pi's driver once first: **rpi-usb-gadget-driver-setup.exe** from
+[github.com/raspberrypi/rpi-usb-gadget/releases](https://github.com/raspberrypi/rpi-usb-gadget/releases).
+Use a data cable (some only charge) and plug it straight into the computer, not a hub. That port then works
+for this only: a USB keyboard or memory stick won't work in it (`uninstall.sh` gives it back).
 
 ## Add music from your PC or phone (and download it back)
 
@@ -156,7 +199,27 @@ look through its songs. (Iris shows its own picture for playlists; it can't show
 **Get missing songs** (on *Your playlists on the Pi*) lists every song from your synced playlists that isn't on
 the Pi yet, each with its iTunes Store, Bandcamp and SoundCloud links, and **Copy the list** puts them on your
 clipboard as "Artist - Title" lines. Buying or downloading them is up to you; everything after that is
-automatic:
+automatic (see the PC helper below, or paste SoundCloud links in *Get songs from SoundCloud*).
+
+### Get songs from SoundCloud
+
+Under **Get songs from SoundCloud**, paste a link to a song, an album or a playlist (in the SoundCloud app:
+**Share → Copy link**; the `on.soundcloud.com` links work) and click **Look it up**. For each song:
+
+- **Download offered:** the artist switched on SoundCloud's download button. Tick the songs and click
+  **Download to the Pi**: the Pi downloads the artist's own file (often a WAV or their full-quality master)
+  into `~/Music/SoundCloud/<Artist> - <Title>/` with its cover, and it shows up in the Pi's music (the menu,
+  Iris, and synced playlists that were waiting for it).
+- **No download:** the page shows the artist's own link instead (their *Buy* or *Free Download* page, if
+  they set one), the song on SoundCloud, and a Bandcamp search. The Pi doesn't record streams.
+- **On the Pi:** it's already there (the page shows which file).
+
+SoundCloud only gives the artists' downloads to signed-in listeners, so the first time the page asks you to
+sign in: drag the **Send my SoundCloud sign-in to the Pi** button to your bookmarks bar, open soundcloud.com
+(signed in) and click the bookmark; it brings you back, signed in. (Or copy the `oauth_token` cookie by hand,
+as the page explains.) The sign-in stays on the Pi, only readable by your user, and the page never shows it;
+**Sign out** forgets it, and so does `uninstall.sh`. SoundCloud gives out no API keys, so this uses the same
+API the SoundCloud website does; if SoundCloud changes it, the page says it can't read the link.
 
 ### Send new music from your PC by itself (Windows)
 
@@ -183,6 +246,17 @@ to the Pi (play those from your phone over Bluetooth). Apple has no official way
 a paid developer account, so this reads Apple's public web page for the playlist. Apple's page only lists
 roughly the first 100-300 songs of a long playlist (the page says so when that happens), and if Apple
 changes the page, the check says it can't read it until the add-on is updated.
+
+### Settings
+
+The **Settings** card at the bottom of the music page changes the add-on's settings: the Bluetooth name,
+connecting to your phone at power-on, album art, when the screen turns off, an upside-down screen, the Y-button
+pin on early boards, the volume step, how often synced playlists are checked, a password for the page, and
+the hotspot's name, password and timing. Save, and the part that uses them picks them up by itself (the
+screen program restarts for a few seconds; the music keeps playing). It edits
+`~/.config/pirate-bluetooth/settings.ini`, keeping your comments. The hotspot settings can only be seen and
+changed when you're connected through the hotspot or the USB cable (or the page has a password), so someone
+else on a shared Wi-Fi can't read the hotspot password or switch the Pi to another Wi-Fi.
 
 ### Download music from the Pi
 
@@ -237,6 +311,8 @@ up and down, separately from the phone's own volume.
   Picking a song plays it with the rest of that album, list or folder queued after it.
 - **Queue:** what's playing now (♪) and what's next; pick one to jump to it.
 - **Repeat** (off, all, one song) and **Shuffle**.
+- **Wi-Fi hotspot:** switch the hotspot on or off, *Automatic*, and *How to connect* (Wi-Fi, music page
+  address, hotspot name and password with a QR code, and the USB cable). See above.
 - **Pair a new phone** and **Info** (name, connected phone, headphone volume, the music page address).
 
 Artists and Songs A–Z need Mopidy's music library (Mopidy-Local). If the menu says it's off, see
@@ -313,12 +389,16 @@ pirate-bluetooth forget "My iPhone"   # or: forget all
 pirate-bluetooth library             # is Mopidy's music library (Mopidy-Local) on?  "library on" fixes it
 pirate-bluetooth latency low         # less audio delay (low / normal / safe)
 pirate-bluetooth logs                # recent log lines; "logs -f" keeps watching
-pirate-bluetooth logs upload         # just one part: screen, upload, audio or mopidy
+pirate-bluetooth logs upload         # just one part: screen, upload, audio, network or mopidy
+pirate-bluetooth hotspot             # the hotspot: name, password, on/off;  "hotspot on|off|auto-on|auto-off"
+pirate-bluetooth wifi                # saved Wi-Fi networks and what's in range
+pirate-bluetooth wifi add "Name"     # save a Wi-Fi (asks for its password);  also: wifi forget/join "Name"
 pirate-bluetooth doctor              # why the screen or buttons aren't working, and what to do
 pirate-bluetooth screen-test         # test picture on the screen, and shows which buttons you press
 ```
 
-Settings are in `~/.config/pirate-bluetooth/settings.ini`. They include how long it looks for your phone
+Settings are in `~/.config/pirate-bluetooth/settings.ini` (most of them are on the music page's Settings
+card too). They include how long it looks for your phone
 after power-on (`reconnect_seconds`), album art from the phone (`phone_art`) and the online lookup
 (`art_lookup`), how often synced playlists are checked (`sync_hours`), when the screen turns off
 (`sleep_after`, 0 = never), the Y-button pin on early boards, screen rotation and the volume step.
@@ -370,6 +450,18 @@ After editing, run `systemctl --user restart pirate-bluetooth`.
   iPhone's Bluetooth off and on once. `pirate-bluetooth logs screen` shows whether the phone offered art
   ("Connected to the phone for album art over Bluetooth"). Some apps don't share art; the online lookup
   covers those when the Pi is online.
+- **Can't reach the Pi at all** (no SSH, no music page). Wait 3 minutes after power-on and look for the
+  Pi's own Wi-Fi (*Pirate Audio*) on your phone, or hold **A** → **Wi-Fi hotspot** → **How to connect**.
+  Join it and open `http://10.42.0.1:6681` to add your Wi-Fi.
+- **The hotspot doesn't come on.** `pirate-bluetooth hotspot` says why (for example a missing permission:
+  run `bash install.sh` again). `pirate-bluetooth logs network` has the details.
+- **The USB cable connection doesn't show up on Windows.** Install Raspberry Pi's driver
+  (`rpi-usb-gadget-driver-setup.exe`, see above), use the port marked *USB* (on a Zero), a data cable, and a
+  port on the computer itself rather than a hub. *Code 43* in Device Manager usually means a charge-only or
+  flaky cable or not enough power: try another cable or port. It only works on Trixie, after the reboot that
+  follows the install.
+- **SoundCloud says the sign-in expired.** Click the bookmark on soundcloud.com again. If the bookmark says
+  it can't see the sign-in, use the by-hand way on the page.
 - **A .zip download fails part-way.** The Pi stops a `.zip` it couldn't finish (for example when a file
   can't be read), so the browser shows it as failed instead of saving a broken file. Try again, or download
   that folder's songs one at a time; `pirate-bluetooth logs upload` names the file.
@@ -399,7 +491,13 @@ bash uninstall.sh --purge   # also removes settings.ini and the extra packages i
 | Start at power-on | `loginctl enable-linger` for your user, only if it was off | turned back off |
 | Mopidy's own screen and buttons | `enabled = false` under `[pidi]` and `[raspberry-gpio]` in `mopidy.conf` (not with `--keep-pimoroni-screen`) | switched back on |
 | Mopidy's music library | only if you run `pirate-bluetooth library on`: `enabled = true` under `[local]` in `mopidy.conf` (old file kept as `mopidy.conf.before-library-on`) | left on (it's part of Pimoroni's setup) |
-| **Not changed** | Mopidy's music, queue and other settings, default sound output, other sound cards, Wi-Fi, already-installed packages | |
+| Wi-Fi hotspot | user service `pirate-network`; a polkit rule letting your user switch NetworkManager connections (`/etc/polkit-1/rules.d/50-pirate-bluetooth-hotspot.rules`); no internet route for hotspot clients (`/etc/NetworkManager/dnsmasq-shared.d/50-pirate-hotspot.conf`); NetworkManager connection `pirate-hotspot` (made when it first comes on); packages `dnsmasq-base`, `iw`, `polkitd` if missing | removed; packages removed with `--purge` |
+| Wi-Fi power saving off | `/etc/NetworkManager/conf.d/pirate-wifi-powersave.conf` | removed |
+| Empty network settings moved aside at boot (Trixie) | service `pirate-netplan-check` and `/usr/local/lib/pirate-bluetooth/netplan-check`; moved files go to `/var/lib/pirate-bluetooth/netplan-empty` | removed |
+| Network over a USB cable (Trixie; Pi Zero, 4, 5) | package `rpi-usb-gadget`, switched on with `rpi-usb-gadget on` (it adds `dtoverlay=dwc2,dr_mode=peripheral` to `config.txt` and its own NetworkManager connections) | `rpi-usb-gadget off` (reboot to finish); package removed with `--purge` |
+| SoundCloud sign-in | `~/.config/pirate-bluetooth/soundcloud-token` (only if you sign in) | removed |
+| Wi-Fi networks you add or forget | NetworkManager, the same as `nmcli` would (only when you do it on the music page or with `pirate-bluetooth wifi`) | left as they are |
+| **Not changed** | Mopidy's music, queue and other settings, default sound output, other sound cards, your saved Wi-Fi networks, already-installed packages | |
 
 ## Credits
 

@@ -34,6 +34,7 @@ NEW_PACKAGES="" DISABLED_UNITS="" GROUPS_ADDED="" CONFIG_TXT_ADDED=""
 CLASS_CHANGED="" CLASS_ORIG_LINE="" BT_ENABLED_BY_US="" RFKILL_UNBLOCKED="" ASOUND_CREATED=""
 LINGER_ENABLED_BY_US="" MOPIDY_EXTS_DISABLED="" MOPIDY_CONF_FILE=""
 MOPIDY_INSTALLED_BY_US="" MOPIDY_CONF_CREATED="" EXP_CHANGED=""
+NM_POWERSAVE_ADDED="" POLKIT_RULE_ADDED="" HOTSPOT_DNSMASQ_ADDED="" NETPLAN_CHECK_ADDED="" USB_GADGET_ON_BY_US=""
 EXP_MARK="# pirate-bluetooth: lets phones send album art over Bluetooth (uninstall.sh removes the line below)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -f "$RECORD" ]; then
@@ -44,10 +45,11 @@ else
 fi
 sudo -v
 
-inform "Stopping the screen/buttons program (it gives the screen back to Mopidy) and the upload page"
+inform "Stopping the screen/buttons program (it gives the screen back to Mopidy), the music page and the hotspot"
 systemctl --user disable --now pirate-bluetooth 2>/dev/null || true
 systemctl --user disable --now pirate-upload 2>/dev/null || true
-rm -f "$USER_UNIT" "$HOME/.config/systemd/user/pirate-upload.service"
+systemctl --user disable --now pirate-network 2>/dev/null || true
+rm -f "$USER_UNIT" "$HOME/.config/systemd/user/pirate-upload.service" "$HOME/.config/systemd/user/pirate-network.service"
 systemctl --user daemon-reload || true
 # Give Pimoroni's screen and buttons back to Mopidy, if the installer took them.
 if [ -n "$MOPIDY_EXTS_DISABLED" ] && [ -n "$MOPIDY_CONF_FILE" ] && [ -f "$MOPIDY_CONF_FILE" ]; then
@@ -127,6 +129,34 @@ if [ -f "$MAIN_CONF" ] && grep -qF "$CLASS_MARK" "$MAIN_CONF"; then
     rm -f "$TMP"
 fi
 
+# Wi-Fi: the add-on's hotspot connection and its settings files (your saved Wi-Fi networks stay)
+if command -v nmcli >/dev/null 2>&1 && nmcli -t -f NAME connection show 2>/dev/null | grep -qx "pirate-hotspot"; then
+    inform "Removing the add-on's Wi-Fi hotspot (if you're connected through it, this ends the connection)"
+    sudo nmcli connection delete id pirate-hotspot >/dev/null 2>&1 || true
+fi
+if [ "$POLKIT_RULE_ADDED" = "yes" ]; then
+    sudo rm -f "$ROOT/etc/polkit-1/rules.d/50-pirate-bluetooth-hotspot.rules"
+fi
+if [ "$HOTSPOT_DNSMASQ_ADDED" = "yes" ]; then
+    sudo rm -f "$ROOT/etc/NetworkManager/dnsmasq-shared.d/50-pirate-hotspot.conf"
+fi
+if [ "$NM_POWERSAVE_ADDED" = "yes" ]; then
+    inform "Wi-Fi power saving goes back to the system's default (from the next boot)"
+    sudo rm -f "$ROOT/etc/NetworkManager/conf.d/pirate-wifi-powersave.conf"
+fi
+if [ "$NETPLAN_CHECK_ADDED" = "yes" ]; then
+    sudo systemctl disable pirate-netplan-check 2>/dev/null || true
+    sudo rm -f "$UNIT_DIR/pirate-netplan-check.service" "$ROOT/usr/local/lib/pirate-bluetooth/netplan-check"
+    sudo rmdir "$ROOT/usr/local/lib/pirate-bluetooth" 2>/dev/null || true
+    sudo systemctl daemon-reload
+fi
+USB_OFF=false
+if [ "$USB_GADGET_ON_BY_US" = "yes" ] && command -v rpi-usb-gadget >/dev/null 2>&1; then
+    inform "Switching the USB cable connection off (the USB port works normally again after a reboot)"
+    sudo rpi-usb-gadget off >/dev/null || true
+    USB_OFF=true
+fi
+
 # The add-on renamed the Bluetooth adapter; an empty alias puts BlueZ's default name back.
 busctl --system set-property org.bluez /org/bluez/hci0 org.bluez.Adapter1 Alias s "" 2>/dev/null || true
 if [ "$BT_ENABLED_BY_US" = "yes" ]; then
@@ -146,7 +176,7 @@ fi
 inform "Removing the program and the pirate-bluetooth command"
 sudo rm -f "$BIN_DIR/pirate-bluetooth"
 rm -rf "$APP_DIR" "$STATE_DIR"
-rm -f "$RECORD"
+rm -f "$RECORD" "$CONF_DIR/soundcloud-token"  # the SoundCloud sign-in isn't a setting: it goes too
 if $PURGE; then
     rm -rf "$CONF_DIR"
 fi
@@ -157,4 +187,5 @@ success "Removed."
 [ -n "$GROUPS_ADDED" ] && echo "Your user stays in these groups (harmless):$GROUPS_ADDED"
 $PURGE || echo "Your settings are still in $CONF_DIR (use --purge to remove them)."
 echo "Music you uploaded stays in ~/Music."
+$USB_OFF && echo "Reboot to give the USB port back to USB devices: sudo reboot"
 exit 0
