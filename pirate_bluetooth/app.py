@@ -70,6 +70,20 @@ class RecordRenderer:
         return view
 
 
+def playlist_icons():
+    """Icons of the playlists saved from the music page: {Mopidy playlist URI or "name:<name>": picture file}."""
+    out = {}
+    data = read_json(os.path.join(STATE_DIR, "playlists.json")) or {}
+    for p in data.get("playlists") or []:
+        path = os.path.join(STATE_DIR, "playlist-icons", f"{p.get('id', '')}.jpg")
+        if p.get("id") and os.path.exists(path):
+            if p.get("mopidy_uri"):
+                out[p["mopidy_uri"]] = path
+            if p.get("name"):
+                out["name:" + p["name"]] = path
+    return out
+
+
 def _repeat_mode(state):
     if not state.get("repeat"):
         return "off"
@@ -801,7 +815,7 @@ class App:
         if item is None:
             return
         if item.kind == "dir":
-            self.open_page(Page(item.label, load=item.load or ("browse", item.uri)))
+            self.open_page(Page(item.label, load=item.load or ("browse", item.uri), icon=item.icon))
         elif item.kind == "track":
             tracks = [i for i in page.items if i.kind == "track"]
             index = next(n for n, i in enumerate(tracks) if i is item)
@@ -890,7 +904,10 @@ class App:
             return items, cursor
         if kind == "playlists":
             refs = self.pi.playlists()
-            return [Item(r.get("name", "?"), "dir", uri=r["uri"], load=("playlist", r["uri"])) for r in refs], 0
+            icons = playlist_icons()
+            return [Item(r.get("name", "?"), "dir", uri=r["uri"], load=("playlist", r["uri"]),
+                         icon=icons.get(r["uri"]) or icons.get("name:" + r.get("name", ""), ""))
+                    for r in refs], 0
         if kind == "playlist":
             refs = self.pi.playlist_items(load[1])
         elif kind == "folders":
@@ -1017,8 +1034,9 @@ class App:
             page = self.menu.page
             view.kind = "menu"
             view.title = page.title
-            view.menu = [{"label": i.label, "kind": i.kind, "value": i.value, "current": i.current}
-                         for i in page.visible()]
+            view.menu = [{"label": i.label, "kind": i.kind, "value": i.value, "current": i.current,
+                          "icon": i.icon} for i in page.visible()]
+            view.menu_icon = page.icon
             view.menu_cursor = page.cursor - page.offset
             view.menu_offset, view.menu_total = page.offset, len(page.items)
             view.menu_note = "Loading…" if page.loading else page.error

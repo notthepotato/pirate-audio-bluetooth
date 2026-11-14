@@ -132,6 +132,52 @@ the music on the Pi:
 order: hold **A** → **Playlists** on the Pirate Audio, or find it in Iris. Your picks are remembered, and when
 you drop missing songs on the page, the check runs again by itself. Save again to update the playlist.
 
+### Playlists that keep themselves up to date
+
+With **Keep it in sync** ticked (it is by default), a saved playlist looks after itself:
+
+- **Every 6 hours** the Pi reads the Apple Music playlist again, so songs you add or remove on your phone
+  follow on the Pi too.
+- **About a minute after new music arrives** (dropped on the page, or sent by the PC helper below), the Pi
+  matches the playlist again and adds the songs that are now there. You don't have to save again.
+- Clear matches and your picks go in; songs that need a pick or aren't on the Pi yet wait.
+
+**Your playlists on the Pi** on the music page lists them, with how many songs are there, **Sync now**,
+**Stop syncing** / **Keep in sync**, and **Forget** (stops syncing; the Pi's playlist stays). Change how often it
+checks with `sync_hours` under `[upload]` in `settings.ini`.
+
+**Icons:** a playlist can use **Apple's picture** for it (the default when Apple has one), **your own
+picture** (*Choose icon…*: any JPEG, PNG, WebP or GIF; it's cropped to a square), or none. The icon shows on the
+music page and on the Pirate Audio: next to the playlist's name in **Playlists**, and next to the title while you
+look through its songs. (Iris shows its own picture for playlists; it can't show these.)
+
+### Getting the missing songs
+
+**Get missing songs** (on *Your playlists on the Pi*) lists every song from your synced playlists that isn't on
+the Pi yet, each with its iTunes Store, Bandcamp and SoundCloud links, and **Copy the list** puts them on your
+clipboard as "Artist - Title" lines. Buying or downloading them is up to you; everything after that is
+automatic:
+
+### Send new music from your PC by itself (Windows)
+
+The **Send new music from this PC by itself** card on the music page (on a PC) has a small helper for Windows.
+It watches your music folders and sends new songs to the Pi in the background, keeping their Artist/Album
+folders and skipping songs that are already there:
+
+- songs you buy in **iTunes** or the **Apple Music app** (it watches their music folders),
+- anything you put in **`Music\Pirate Audio`** (it makes that folder): unzipped Bandcamp downloads, free
+  SoundCloud downloads, your own files.
+
+1. Click **Download the helper**.
+2. In the Downloads folder, click in the address bar, type `powershell` and press Enter. Then run:
+   `powershell -ExecutionPolicy Bypass -File pirate-sync.ps1 -Install`
+3. That's it: it runs now and starts with Windows. `-Uninstall` stops it. Other folders:
+   `... -Install -Folders "D:\Music\Bandcamp"`. If the music page has a password, add `-Password "..."` (it's
+   kept encrypted for your Windows user). What it did: `%LOCALAPPDATA%\PirateSync\log.txt`.
+
+Once a song lands on the Pi, synced playlists pick it up a minute later. Nothing on your PC is changed or
+deleted, and copy-protected Apple Music subscription downloads are skipped (the Pi can't play them).
+
 Good to know: songs downloaded with an Apple Music subscription are copy-protected, so they can't be copied
 to the Pi (play those from your phone over Bluetooth). Apple has no official way to read playlists without
 a paid developer account, so this reads Apple's public web page for the playlist. Apple's page only lists
@@ -274,7 +320,7 @@ pirate-bluetooth screen-test         # test picture on the screen, and shows whi
 
 Settings are in `~/.config/pirate-bluetooth/settings.ini`. They include how long it looks for your phone
 after power-on (`reconnect_seconds`), album art from the phone (`phone_art`) and the online lookup
-(`art_lookup`), when the screen turns off
+(`art_lookup`), how often synced playlists are checked (`sync_hours`), when the screen turns off
 (`sleep_after`, 0 = never), the Y-button pin on early boards, screen rotation and the volume step.
 After editing, run `systemctl --user restart pirate-bluetooth`.
 

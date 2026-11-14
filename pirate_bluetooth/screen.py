@@ -10,7 +10,7 @@ import logging
 import os
 from typing import List, Tuple
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from .view import View
 
@@ -143,6 +143,29 @@ class Renderer:
         self._art_base = None
         self._accent = (235, 235, 240)
         self._shade = _shade_mask(96, 235)
+        self._thumbs = {}  # (path, size) -> (mtime, picture): playlist icons in menus
+
+    def _thumb(self, path, size):
+        """A small rounded picture for a menu (cached), or None if it can't be read."""
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return None
+        key = (path, size)
+        hit = self._thumbs.get(key)
+        if hit and hit[0] == mtime:
+            return hit[1]
+        try:
+            with Image.open(path) as img:
+                pic = ImageOps.fit(img.convert("RGB"), (size, size), method=BILINEAR)
+        except Exception:
+            return None
+        mask = Image.new("L", (size, size), 0)
+        ImageDraw.Draw(mask).rounded_rectangle((0, 0, size - 1, size - 1), radius=max(3, size // 5), fill=255)
+        if len(self._thumbs) > 64:
+            self._thumbs.clear()
+        self._thumbs[key] = (mtime, (pic, mask))
+        return pic, mask
 
     # -- helpers -----------------------------------------------------------------
     def _centered(self, d, text, y, font, fill):
@@ -346,7 +369,12 @@ class Renderer:
         count = f"{view.menu_offset + view.menu_cursor + 1}/{view.menu_total}" if view.menu_total > MENU_ROWS else ""
         small = self.fonts.get(11)
         count_w = _text_width(d, count, small) if count else 0
-        d.text((12, 24), _ellipsize(d, view.title, title_font, 216 - count_w - 8), font=title_font, fill=TEXT)
+        tx = 12
+        icon = self._thumb(view.menu_icon, 20) if getattr(view, "menu_icon", "") else None
+        if icon:
+            frame.paste(icon[0], (12, 25), icon[1])
+            tx = 38
+        d.text((tx, 24), _ellipsize(d, view.title, title_font, 228 - tx - count_w - 8), font=title_font, fill=TEXT)
         if count:
             d.text((228 - count_w, 28), count, font=small, fill=FAINT)
 
@@ -367,6 +395,13 @@ class Renderer:
             if row.get("current"):
                 d.text((x, y + 5), "♪", font=self.fonts.get(15, bold=True), fill=GREEN)
                 x += 16
+            icon = self._thumb(row["icon"], 20) if row.get("icon") else None
+            if icon:
+                frame.paste(icon[0], (x - 2, y + 4), icon[1])
+                x += 25
+            elif row["kind"] == "dir" and any(r.get("icon") for r in rows):  # keep the names lined up
+                d.rounded_rectangle((x - 2, y + 4, x + 17, y + 23), radius=4, outline=FAINT)
+                x += 25
             value = row.get("value") or ("›" if row["kind"] == "dir" else "")
             if value:
                 vf = self.fonts.get(13, bold=row["kind"] != "dir")

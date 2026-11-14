@@ -20,6 +20,7 @@ class Item:
     tlid: Optional[int] = None
     current: bool = False  # the song that's playing now
     load: tuple = ()  # for kind == "dir": what to load when it's opened
+    icon: str = ""  # a small picture shown before the label (playlists), or ""
 
 
 @dataclass
@@ -31,6 +32,7 @@ class Page:
     offset: int = 0
     loading: bool = False
     error: str = ""
+    icon: str = ""  # shown next to the title (a playlist's icon)
 
     def set_items(self, items, cursor=0):
         self.items = items

@@ -22,6 +22,7 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -31,7 +32,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import mopidyconf, playlist
+from . import mopidyconf, playlist, playsync
 
 log = logging.getLogger("pirate_upload")
 
@@ -55,6 +56,7 @@ DEFAULTS = {
         "keep_free_mb": "500",
         "scan_delay": "8",
         "scan_command": "auto",
+        "sync_hours": "6",
     },
 }
 
@@ -476,6 +478,9 @@ class Handler(BaseHTTPRequestHandler):
     index: playlist.LibraryIndex = None  # the Pi's songs, for the playlist check
     picks: playlist.Picks = None
     rpc = None  # Mopidy's JSON-RPC, for saving playlists
+    registry: playsync.Registry = None  # playlists kept in sync, with their icons
+    syncer: playsync.Syncer = None
+    checked = {}  # playlist id -> the last check's Apple data (so saving doesn't ask Apple again)
 
     def log_message(self, fmt, *args):
         log.debug("%s %s", self.address_string(), fmt % args)
@@ -538,6 +543,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"ok": False, "status": err.status, "error": err.message})
             except ValueError:
                 self._send(200, {"ok": False, "status": 400, "error": "Bad size."})
+        elif path == "/api/playlists":
+            self._send(200, {"playlists": [playsync.public(e) for e in self.registry.all()],
+                             "sync_hours": self.syncer.sync_hours})
+        elif path == "/api/playlists/icon":
+            self._get_icon(urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("id", [""])[0])
+        elif path == "/api/missing":
+            self._send(200, {"playlists": [{"id": e["id"], "name": e.get("name"), "missing": e.get("missing") or []}
+                                           for e in self.registry.all() if e.get("missing")]})
+        elif path == "/pirate-sync.ps1":
+            self._send_sync_script()
         elif path in ("/api/browse", "/api/download", "/api/zip"):
             query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             raw_path = (query.get("path") or [""])[0]
@@ -650,6 +665,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             return
         url = urllib.parse.urlparse(self.path)
+        if url.path == "/api/playlists/icon" and self._same_origin():
+            return self._put_icon(urllib.parse.parse_qs(url.query).get("id", [""])[0])
         if url.path != "/api/upload":
             self._send(404, {"error": "Not found"})
             return
@@ -682,6 +699,8 @@ class Handler(BaseHTTPRequestHandler):
             self.scanner.request()
             if self.index:
                 self.index.invalidate()
+            if self.syncer:
+                self.syncer.library_changed()
         self._send(200, result)
 
     def _json_body(self, limit=2 * 2**20):
@@ -709,10 +728,15 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/scan":
             self.scanner.request(delay=0)
             self._send(202, self.scanner.status())
-        elif path in ("/api/playlist/check", "/api/playlist/save"):
+        elif path in ("/api/playlist/check", "/api/playlist/save") or path.startswith("/api/playlists/"):
             try:
                 body = self._json_body()
-                result = self._playlist_check(body) if path.endswith("check") else self._playlist_save(body)
+                if path == "/api/playlist/check":
+                    result = self._playlist_check(body)
+                elif path == "/api/playlist/save":
+                    result = self._playlist_save(body)
+                else:
+                    result = self._playlists_action(path.rsplit("/", 1)[-1], body)
             except UploadError as err:
                 self._send(err.status, {"error": err.message})
             except playlist.PlaylistError as err:
@@ -732,6 +756,13 @@ class Handler(BaseHTTPRequestHandler):
         log.info("Playlist check of %r: %d songs, %d on the Pi, %d to pick, %d missing", result["name"],
                  len(result["tracks"]), result["counts"]["on_pi"], result["counts"]["choose"],
                  result["counts"]["missing"])
+        if len(Handler.checked) > 20:
+            Handler.checked.clear()
+        Handler.checked[result["id"]] = {"tracks": result.pop("page_tracks"), "artwork": result["artwork"],
+                                         "name": result["name"], "country": result["country"], "url": link,
+                                         "at": time.time()}
+        saved = self.registry.get(result["id"])
+        result["saved"] = playsync.public(saved) if saved else None
         return result
 
     def _playlist_save(self, body):
@@ -744,11 +775,103 @@ class Handler(BaseHTTPRequestHandler):
         songs = [s for s in songs if s["uri"] in known][:5000]  # only songs that really are on the Pi
         if not songs:
             raise UploadError(400, "None of the playlist's songs are on the Pi yet, so there's nothing to save.")
-        where, count, name = playlist.save_playlist(str(body.get("name", "")), songs, self.rpc,
-                                                    str(self.store.root))
+        where, count, name, uri = playlist.save_playlist(str(body.get("name", "")), songs, self.rpc,
+                                                         str(self.store.root))
         log.info("Saved playlist %r with %d songs (%s)", name, count, where)
-        return {"saved": count, "name": name, "where": "mopidy" if where == "mopidy" else
-                where.replace(os.path.expanduser("~"), "~", 1)}
+        result = {"saved": count, "name": name, "where": "mopidy" if where == "mopidy" else
+                  where.replace(os.path.expanduser("~"), "~", 1)}
+        pid = str(body.get("id", ""))
+        info = Handler.checked.get(pid)
+        if info:  # remember it (to keep it in sync, and for its icon)
+            old = self.registry.get(pid) or {}
+            entry = {**old, "id": pid, "country": info["country"], "url": info["url"], "name": name,
+                     "apple_name": info["name"], "tracks": info["tracks"], "last_fetch": info["at"],
+                     "artwork": info["artwork"], "sync": bool(body.get("sync", old.get("sync", True))),
+                     "saved_uris": [s["uri"] for s in songs], "mopidy_uri": uri,
+                     "icon": old.get("icon")}
+            self.registry.put(entry)
+            icon = body.get("icon")
+            if icon == "apple" or (icon is None and not old and info["artwork"]):
+                try:
+                    playsync.fetch_apple_icon(pid, info["artwork"])
+                    self.registry.update(pid, icon="apple")
+                except playlist.PlaylistError as err:
+                    result["icon_error"] = str(err)
+            self.syncer.sync(pid)  # what's still missing (no new save: the songs are the same)
+            result["playlist"] = playsync.public(self.registry.get(pid))
+        return result
+
+    def _playlists_action(self, action, body):
+        pid = str(body.get("id", ""))
+        entry = self.registry.get(pid)
+        if not entry:
+            raise UploadError(404, "That playlist isn't saved on the Pi (check it and save it first).")
+        if action == "sync":
+            self.syncer.sync(pid, refetch=True, force=True)
+        elif action == "settings":
+            changes = {}
+            if "sync" in body:
+                changes["sync"] = bool(body["sync"])
+            self.registry.update(pid, **changes)
+        elif action == "icon-apple":
+            url = entry.get("artwork") or ""
+            if not url:
+                page = playlist.parse_page(playlist.fetch_page(entry.get("country", "us"), pid))
+                url = page.get("artwork", "")
+                self.registry.update(pid, artwork=url)
+            playsync.fetch_apple_icon(pid, url)
+            self.registry.update(pid, icon="apple")
+        elif action == "icon-remove":
+            try:
+                os.remove(playsync.icon_path(pid))
+            except OSError:
+                pass
+            self.registry.update(pid, icon=None)
+        elif action == "forget":
+            self.registry.remove(pid)
+            return {"forgotten": pid}
+        else:
+            raise UploadError(404, "Not found")
+        return {"playlist": playsync.public(self.registry.get(pid))}
+
+    def _put_icon(self, pid):
+        try:
+            if not self.registry.get(pid):
+                raise UploadError(404, "That playlist isn't saved on the Pi.")
+            length = int(self.headers.get("Content-Length", "-1"))
+            if not 0 < length <= playsync.MAX_ICON_BYTES:
+                raise UploadError(413, "That picture is empty or too big (10 MB at most).")
+            playsync.store_icon(pid, self.rfile.read(length))
+            self.registry.update(pid, icon="custom")
+        except UploadError as err:
+            self.close_connection = True
+            return self._send(err.status, {"error": err.message})
+        except (playlist.PlaylistError, ValueError) as err:
+            self.close_connection = True
+            return self._send(400, {"error": str(err)})
+        self._send(200, {"playlist": playsync.public(self.registry.get(pid))})
+
+    def _get_icon(self, pid):
+        try:
+            data = Path(playsync.icon_path(pid)).read_bytes()
+        except (OSError, playlist.PlaylistError):
+            return self._send(404, {"error": "No icon"})
+        self._send(200, data, "image/jpeg")
+
+    def _send_sync_script(self):
+        """The PC helper that uploads new music by itself, with this Pi's address filled in."""
+        host = self.headers.get("Host") or f"{socket.gethostname()}.local:{self.server.server_port}"
+        script = (WEB_DIR / "pirate-sync.ps1").read_text(encoding="utf-8").replace("@PI_ADDRESS@", f"http://{host}")
+        data = script.replace("\r\n", "\n").replace("\n", "\r\n").encode("utf-8-sig")  # Windows PowerShell 5 needs the BOM
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Disposition", 'attachment; filename="pirate-sync.ps1"')
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
 
 def load_config(path):
@@ -804,6 +927,10 @@ def main(argv=None):
     Handler.rpc = staticmethod(playlist.mopidy_rpc(rpc_url))  # no Mopidy: calls fail, file names are used
     Handler.index = playlist.LibraryIndex(up.get("music_dir"), Handler.rpc)
     Handler.picks = playlist.Picks(os.path.expanduser("~/.local/state/pirate-bluetooth/playlist-picks.json"))
+    Handler.registry = playsync.Registry()
+    Handler.syncer = playsync.Syncer(Handler.registry, Handler.index, Handler.picks, Handler.rpc,
+                                     str(Handler.store.root), sync_hours=max(0.5, up.getfloat("sync_hours")))
+    Handler.syncer.start()
     port = args.port or up.getint("port")
 
     server = ThreadingHTTPServer((args.bind, port), Handler)

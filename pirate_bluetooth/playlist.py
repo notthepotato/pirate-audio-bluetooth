@@ -37,7 +37,7 @@ ITUNES_LOOKUP = os.environ.get("PIRATE_ITUNES_LOOKUP", "https://itunes.apple.com
 AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".flac", ".ogg", ".oga", ".opus", ".wav", ".aif", ".aiff",
               ".wma", ".ape", ".wv", ".mka", ".alac"}
 MAX_PAGE = 12 * 2**20
-USER_AGENT = "Mozilla/5.0 (X11; Linux aarch64) PirateAudio/1.2 (playlist check)"
+USER_AGENT = "Mozilla/5.0 (X11; Linux aarch64) PirateAudio/1.3 (playlist check)"
 VERSION_WORDS = {"remix", "vip", "live", "edit", "extended", "acoustic", "instrumental", "mix", "demo",
                  "bootleg", "flip", "cover", "slowed", "sped", "nightcore", "rework", "dub", "reprise",
                  "unplugged", "orchestral", "remixed", "version", "clean", "explicit"}
@@ -153,8 +153,9 @@ def _iso_duration_ms(text):
 
 
 def parse_page(page):
-    """{"name", "tracks": [...], "reported": number of songs Apple says the playlist has (or None)}."""
-    name, tracks, reported = "", [], None
+    """{"name", "tracks": [...], "reported": number of songs Apple says the playlist has (or None),
+    "artwork": the playlist's picture (URL) or ""}."""
+    name, tracks, reported, artwork = "", [], None, ""
     for raw in _scripts(page, r'id=["\']serialized-server-data["\']'):
         try:
             data = json.loads(html.unescape(raw) if raw.lstrip().startswith("&") else raw)
@@ -179,6 +180,7 @@ def parse_page(page):
                 head = d["items"][0]
                 if isinstance(head, dict):
                     name = name or _text(head.get("title"))
+                    artwork = artwork or _artwork_url(head)
                     for k in ("trackCount", "songCount", "numberOfTracks"):
                         if isinstance(head.get(k), int):
                             reported = head[k]
@@ -206,10 +208,31 @@ def parse_page(page):
         m = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']*)', page, re.I)
         name = html.unescape(m.group(1)).strip() if m else ""
         name = re.sub(r"\s+(by .*)?on Apple Music$", "", name).strip()
+    if not artwork:
+        m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', page, re.I) or \
+            re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', page, re.I)
+        if m:  # the sharing picture (1200x630): ask Apple's image server for a square one instead
+            artwork = re.sub(r"/\d+x\d+[a-z]*(-\d+)?\.(jpg|jpeg|png|webp)$", "/600x600cc.jpg", html.unescape(m.group(1)))
     if not tracks:
         raise PlaylistError("Couldn't find the songs on Apple's page for that playlist. Make sure it's shared "
                             "publicly; if it is, Apple may have changed their page and this check needs an update.")
-    return {"name": name or "Apple Music playlist", "tracks": tracks, "reported": reported}
+    return {"name": name or "Apple Music playlist", "tracks": tracks, "reported": reported,
+            "artwork": artwork if _image_host_ok(artwork) else ""}
+
+
+def _artwork_url(item):
+    """A square picture URL from Apple's artwork template ("…/{w}x{h}{c}.{f}")."""
+    for d in _walk(item.get("artwork") or {}):
+        url = d.get("url") if isinstance(d.get("url"), str) else d.get("template") if isinstance(d.get("template"), str) else ""
+        if "{w}" in url:
+            return url.replace("{w}", "600").replace("{h}", "600").replace("{c}", "cc").replace("{f}", "jpg")
+    return ""
+
+
+def _image_host_ok(url):
+    host = (urllib.parse.urlparse(url or "").hostname or "").lower()
+    return url.startswith("https://") and (host.endswith(".mzstatic.com") or host.endswith(".apple.com")) \
+        or url.startswith(APPLE_BASE + "/")
 
 
 # ==== comparing names ===========================================================================
@@ -542,7 +565,7 @@ def clean_name(name):
 
 
 def save_playlist(name, songs, rpc=None, music_dir="~/Music"):
-    """Save songs [{uri, title, artist}] as a playlist. Returns (where, how many)."""
+    """Save songs [{uri, title, artist}] as a playlist. Returns (where, how many, name, playlist URI)."""
     name = clean_name(name)
     tracks = [{"__model__": "Track", "uri": s["uri"], "name": s.get("title") or "",
                **({"artists": [{"__model__": "Artist", "name": s["artist"]}]} if s.get("artist") else {})}
@@ -557,7 +580,7 @@ def save_playlist(name, songs, rpc=None, music_dir="~/Music"):
                 playlist["tracks"] = tracks
                 saved = rpc("core.playlists.save", playlist=playlist)
                 if saved:
-                    return "mopidy", len(tracks), name
+                    return "mopidy", len(tracks), name, saved.get("uri") or playlist.get("uri", "")
         except Exception as err:
             log.info("Saving the playlist through Mopidy didn't work (%s); writing an .m3u8 file", err)
     folder = Path(os.path.expanduser(music_dir)) / "Playlists"
@@ -569,7 +592,7 @@ def save_playlist(name, songs, rpc=None, music_dir="~/Music"):
         lines.append(urllib.parse.unquote(uri[len("file://"):]) if uri.startswith("file://") else uri)
     target = folder / f"{name}.m3u8"
     target.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return str(target), len(tracks), name
+    return str(target), len(tracks), name, "m3u:" + urllib.parse.quote(target.name)
 
 
 def mopidy_rpc(url):
@@ -601,4 +624,5 @@ def check(link, index, picks, timeout=20):
         note = (f"Apple's page only lists the first {len(rows)} of the playlist's {page['reported']} songs, "
                 "so the rest aren't checked.")
     return {"name": page["name"], "country": country, "id": playlist_id, "tracks": rows, "counts": counts,
-            "library": getattr(index, "source", "files"), "songs_on_pi": len(entries), "note": note}
+            "library": getattr(index, "source", "files"), "songs_on_pi": len(entries), "note": note,
+            "artwork": page.get("artwork", ""), "page_tracks": page["tracks"]}

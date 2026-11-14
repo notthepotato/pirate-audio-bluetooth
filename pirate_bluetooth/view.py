@@ -36,3 +36,4 @@ class View:
     menu_offset: int = 0
     menu_total: int = 0
     menu_note: str = ""
+    menu_icon: str = ""  # picture next to the menu's title (a playlist's icon)
