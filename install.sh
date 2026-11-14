@@ -9,7 +9,7 @@
 #
 #   bash install.sh --check     look at the system and say what would change, without changing anything
 #   bash install.sh             install (asks before changing anything)
-#   bash install.sh --name "Kite's Pirate" --y-pin 20 -y
+#   bash install.sh --name "My Pirate" --y-pin 20 -y
 #   bash install.sh --latency low    (less delay; see "pirate-bluetooth latency" to change it later)
 #   bash install.sh --keep-pimoroni-screen   (Mopidy keeps its own screen; no music menu on the device)
 #
@@ -207,6 +207,9 @@ fi
 # Packages: only install what's missing, never upgrade what's there
 WANTED=(bluez bluez-alsa-utils alsa-utils curl python3-venv python3-pip python3-dev python3-pil python3-numpy
         python3-spidev python3-gi python3-gpiozero python3-lgpio fonts-dejavu-core)
+# Trixie packages libgpiod's Python bindings in the version the screen driver needs (2.x), so pip doesn't
+# have to build them; Bookworm's are too old (1.x) and pip brings its own into the add-on's environment.
+[ "$CODENAME" = trixie ] && WANTED+=(python3-libgpiod)
 # Pimoroni's Mopidy setup, or a fresh install of it?
 MOPIDY=false
 systemctl --user cat mopidy >/dev/null 2>&1 && MOPIDY=true
@@ -629,8 +632,21 @@ if [ "$LINGER_ACTION" = "enable" ]; then
     sudo loginctl enable-linger "$USER"
     record LINGER_ENABLED_BY_US yes
 fi
+HW_STATE="$HOME/.local/state/pirate-bluetooth/hardware.json"
+SCREEN_CHECK=""
 if ! $REBOOT_NEEDED; then
+    rm -f "$HW_STATE"
     systemctl --user restart pirate-bluetooth
+    # The screen program says whether it got the screen and buttons (it keeps trying if not)
+    for _ in $(seq 1 20); do [ -s "$HW_STATE" ] && break; sleep 1; done
+    if [ -s "$HW_STATE" ]; then
+        SCREEN_CHECK="$(python3 -c 'import json, sys
+s = json.load(open(sys.argv[1]))
+bad = [f"{n}: {s[k]}" for k, n in (("display", "Screen"), ("buttons", "Buttons")) if s.get(k) not in ("ok", "not in use")]
+print("\n".join(bad) if bad else "ok")' "$HW_STATE" 2>/dev/null || true)"
+    else
+        SCREEN_CHECK="The screen program didn't start (see: pirate-bluetooth logs screen)"
+    fi
 fi
 if $UPLOAD; then
     systemctl --user enable pirate-upload
@@ -672,9 +688,16 @@ if $INSTALL_MOPIDY; then
     echo "The Pi's music player: Iris at http://$(hostname).local:6680/iris (add music on the music page)."
 fi
 echo "Useful:  pirate-bluetooth (status)   pirate-bluetooth logs -f   bash uninstall.sh"
+if [ -n "$SCREEN_CHECK" ] && [ "$SCREEN_CHECK" != "ok" ]; then
+    echo
+    warning "The screen or buttons aren't working yet:"
+    echo "$SCREEN_CHECK" | sed 's/^/  /'
+    echo "  Run 'pirate-bluetooth doctor' to see why and what to do (the screen program keeps trying)."
+fi
 if $REBOOT_NEEDED; then
     echo
     warning "A reboot is needed to finish (hardware settings or group changes)."
+    echo "If the screen stays blank after the reboot, run: pirate-bluetooth doctor"
     if ! $ASSUME_YES; then
         read -r -p "Reboot now? [y/N] " answer
         [[ "$answer" =~ ^[Yy] ]] && sudo reboot

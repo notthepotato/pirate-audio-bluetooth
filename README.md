@@ -1,5 +1,7 @@
 # Pirate Audio Bluetooth add-on
 
+*By potato.*
+
 Pair your iPhone with your Raspberry Pi like a pair of headphones and listen through the **Pirate Audio's
 headphone jack**. It works with no Wi-Fi or internet at all, so songs you've downloaded in Apple Music play
 anywhere. The Pirate Audio's screen shows the song, artist, album art and progress, and the four buttons
@@ -258,12 +260,14 @@ link add roughly another 0.1-0.2 s that the Pi can't change.
 ```bash
 pirate-bluetooth                     # status: name, pairing mode, paired phones, where album art comes from
 pirate-bluetooth pair                # pairing mode for 3 minutes
-pirate-bluetooth name "Potato's Pirate"
-pirate-bluetooth forget "Potato's iPhone"   # or: forget all
+pirate-bluetooth name "My Pirate"
+pirate-bluetooth forget "My iPhone"   # or: forget all
 pirate-bluetooth library             # is Mopidy's music library (Mopidy-Local) on?  "library on" fixes it
 pirate-bluetooth latency low         # less audio delay (low / normal / safe)
 pirate-bluetooth logs                # recent log lines; "logs -f" keeps watching
 pirate-bluetooth logs upload         # just one part: screen, upload, audio or mopidy
+pirate-bluetooth doctor              # why the screen or buttons aren't working, and what to do
+pirate-bluetooth screen-test         # test picture on the screen, and shows which buttons you press
 ```
 
 Settings are in `~/.config/pirate-bluetooth/settings.ini`. They include how long it looks for your phone
@@ -298,8 +302,13 @@ After editing, run `systemctl --user restart pirate-bluetooth`.
 - **The music page doesn't open.** Check that your PC or phone is on the same Wi-Fi as the Pi, and try the IP
   address from the info screen instead of `raspberrypi.local`. Then check `systemctl --user status pirate-upload`.
   Some campus and public networks block devices from reaching each other.
-- **The screen stays dark, or the buttons do nothing.** `pirate-bluetooth logs screen` shows why. If
-  Pimoroni's screen extension is still on (Mopidy's screen comes back), run `bash install.sh` again.
+- **The screen only lights up (no picture), or the buttons do nothing.** Run `pirate-bluetooth doctor`. It
+  checks the usual reasons (SPI not on yet, a reboot still needed after installing, another program using the
+  Pirate Audio's pins, the screen program not running) and says what to do. `pirate-bluetooth screen-test`
+  then draws a test picture and shows each button you press, on its own. The screen program keeps trying by
+  itself, so once the cause is fixed the screen comes on without restarting anything, and the screen works
+  even when the buttons don't (and the other way round). If Pimoroni's screen extension is still on
+  (Mopidy's screen comes back), run `bash install.sh` again.
 - **Uploaded songs don't show in Mopidy's Local media (or Iris's Artists/Albums/Tracks, or the menu's
   Artists and Songs A–Z).** They're always under *Browse → Files* (and the menu's *Folders*). If Local media is missing or stays empty, run `pirate-bluetooth library`. Pimoroni's
   installer saves Mopidy's settings as they were at install time, and if Mopidy-Local had a hiccup at that
@@ -345,6 +354,9 @@ bash uninstall.sh --purge   # also removes settings.ini and the extra packages i
 | **Not changed** | Mopidy's music, queue and other settings, default sound output, other sound cards, Wi-Fi, already-installed packages | |
 
 ## Credits
+
+Made by **potato**.
+
 
 [BlueALSA](https://github.com/arkq/bluez-alsa) and [BlueZ](https://www.bluez.org/) do the Bluetooth work.
 [Mopidy](https://mopidy.com/) and [Iris](https://github.com/jaedb/Iris) play the Pi's own music.

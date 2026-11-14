@@ -413,7 +413,7 @@ class Renderer:
         frame = _vertical_gradient((30, 30, 36), BG)
         d = ImageDraw.Draw(frame)
         y = 84
-        if view.overlay and view.overlay[0] == "toast":  # e.g. "Kite's iPhone disconnected"
+        if view.overlay and view.overlay[0] == "toast":  # e.g. "My iPhone disconnected"
             f = self.fonts.get(13, text=str(view.overlay[1]))
             self._centered(d, _ellipsize(d, str(view.overlay[1]), f, 220), 60, f, SUBTLE)
             y = 96

@@ -23,6 +23,7 @@ from . import __version__, mopidyconf
 from .art import ArtLoader
 from .bluetooth import BluetoothClient
 from .menu import Item, Menu, Page, scroll_step
+from .hardware import plain_error as _plain_error
 from .state import NowPlaying, format_time
 from .system import (HeadphoneVolume, MopidyHandoff, boot_id, local_ip, read_json, shutting_down,
                      uptime, wait_dac_free, write_json)
@@ -106,7 +107,9 @@ class App:
 
         self.display = None
         self.buttons = None
+        self._buttons_ready = False  # self.buttons may stay None on purpose (screen previews)
         self.hw_owned = False
+        self._hw_problem = {}  # "display"/"buttons" -> last error, for `pirate-bluetooth doctor`
         self._hw_attempts = 0
         self._acquire_source = 0
         self._render_pending = False
@@ -160,9 +163,13 @@ class App:
         self._art_fallback = 0  # timer: look the art up online if the phone hasn't sent it by then
         self.cover = None  # album art straight from the phone over Bluetooth (Trixie)
         if cfg.getboolean("bluetooth", "phone_art"):
-            from .coverart import CoverArt
-            self.cover = CoverArt(os.path.join(CACHE_DIR, "art", "incoming"), self.on_phone_picture,
-                                  on_connected=lambda: self._phone_art(False))
+            try:  # an extra: never let it stop the screen from starting
+                from .coverart import CoverArt
+                self.cover = CoverArt(os.path.join(CACHE_DIR, "art", "incoming"), self.on_phone_picture,
+                                      on_connected=lambda: self._phone_art(False))
+            except Exception:
+                log.exception("Album art over Bluetooth couldn't start (the rest works without it)")
+                self.cover = None
         self.pi_art_key = None
         self.pi_track_uri = None
 
@@ -319,34 +326,62 @@ class App:
             return hardware.FifoButtons(self._button_from_thread, self.args.fifo)
         if self.args.preview or self.args.record:
             return None
-        return hardware.GpioButtons(self._button_from_thread,
-                                    y_pin=self.cfg.getint("buttons", "y_pin"),
-                                    hold_time=self.cfg.getfloat("buttons", "hold_time"))
+        return hardware.make_buttons(self._button_from_thread,
+                                     y_pin=self.cfg.getint("buttons", "y_pin"),
+                                     hold_time=self.cfg.getfloat("buttons", "hold_time"))
 
     def acquire(self):
+        """Get the screen and the buttons. Each one works without the other, and whatever isn't there
+        yet is tried again: quickly at first, then every 15 s, for as long as it's needed."""
         self._acquire_source = 0
-        if self.hw_owned or not self.wants_hardware():
+        if not self.wants_hardware():
             return False
-        display = None
-        try:
-            display = self._make_display()
-            buttons = self._make_buttons()
-        except Exception as err:
-            if display is not None:
-                display.close()
-            self._hw_attempts += 1
-            if self._hw_attempts <= HW_RETRIES:
-                log.warning("Display/buttons not available yet (%s); retrying", err)
-                self._acquire_source = GLib.timeout_add(1000, self.acquire)
-            else:
-                log.error("Giving up on the display/buttons: %s", err)
+        if self.hw_owned and self.display is not None and self._buttons_ready:
             return False
-        self._hw_attempts = 0
-        self.display, self.buttons, self.hw_owned = display, buttons, True
-        log.info("Display and buttons ready")
-        self.wake()
-        self._render()
+        problems = {}
+        got = []
+        if self.display is None:
+            try:
+                self.display = self._make_display()
+                got.append("Display")
+            except Exception as err:
+                problems["display"] = err
+        if not self._buttons_ready:
+            try:
+                self.buttons = self._make_buttons()
+                self._buttons_ready = True
+                got.append("buttons")
+            except Exception as err:
+                problems["buttons"] = err
+        if self.display is not None or self._buttons_ready:
+            self.hw_owned = True
+        self._hw_attempts = self._hw_attempts + 1 if problems else 0
+        for part, err in problems.items():
+            if self._hw_attempts in (1, HW_RETRIES) or self._hw_attempts % 40 == 0:
+                (log.warning if self._hw_attempts < HW_RETRIES else log.error)(
+                    "The %s working yet (%s); trying again%s", "screen isn't" if part == "display" else "buttons aren't",
+                    _plain_error(err), "" if self._hw_attempts < HW_RETRIES else " every 15 s")
+        self._report_hardware(problems)
+        if problems:
+            delay = 1000 if self._hw_attempts < HW_RETRIES else 15000
+            self._acquire_source = GLib.timeout_add(delay, self.acquire)
+        if got:
+            log.info("%s ready", " and ".join(got).capitalize())
+            self.wake()
+            if self.display is not None:
+                self._render()
         return False
+
+    def _report_hardware(self, problems):
+        """~/.local/state/pirate-bluetooth/hardware.json: what `pirate-bluetooth doctor` shows."""
+        state = {part: ("ok" if (self.display is not None if part == "display" else self._buttons_ready)
+                        else _plain_error(problems[part]) if part in problems else "not in use")
+                 for part in ("display", "buttons")}
+        if state != self._hw_problem:
+            self._hw_problem = state
+            if not (self.args.record or self.args.preview):
+                write_json(os.path.join(STATE_DIR, "hardware.json"), {**state, "at": int(time.time()),
+                                                                       "pid": os.getpid()})
 
     def release(self, handback_screen=True):
         if self._acquire_source:
@@ -354,6 +389,7 @@ class App:
             self._acquire_source = 0
         if not self.hw_owned:
             return
+        self._buttons_ready = False
         if self.buttons:
             self.buttons.close()
         if self.display:
@@ -933,7 +969,8 @@ class App:
             log.info("Screen off (idle)")
             self.asleep = True
             self.menu.close()
-            self.display.backlight(False)
+            if self.display:
+                self.display.backlight(False)
         self._update_ownership()
         if dirty:
             self.request_render()
@@ -1033,7 +1070,7 @@ class App:
 
     def _render(self):
         self._render_pending = False
-        if not self.hw_owned or self.asleep:
+        if not self.hw_owned or self.asleep or self.display is None:
             return False
         try:
             self.display.show(self.renderer.render(self.build_view()))

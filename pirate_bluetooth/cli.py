@@ -11,6 +11,7 @@ import re
 import socket
 import subprocess
 import sys
+import time
 
 from gi.repository import Gio, GLib
 
@@ -296,6 +297,187 @@ def cmd_name(bz, args):
     print(f"Renamed to \"{new}\". Phones that already paired may show the new name after reconnecting.")
 
 
+# == finding out why the screen or buttons don't work =============================================
+APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.environ.get("PIRATE_TEST_ROOT", "")  # tests only
+
+
+def _run(cmd, timeout=10):
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return res.returncode, res.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return None, ""
+
+
+def _config_txt():
+    for path in (f"{ROOT}/boot/firmware/config.txt", f"{ROOT}/boot/config.txt"):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                return path, [ln.split("#", 1)[0].strip() for ln in fh]
+        except OSError:
+            continue
+    return None, []
+
+
+def _service_groups():
+    """Groups the running screen program actually has (they only change when it starts)."""
+    _rc, pid = _run(["systemctl", "--user", "show", "-p", "MainPID", "--value", "pirate-bluetooth"])
+    if not pid or pid == "0":
+        return None
+    try:
+        with open(f"/proc/{pid}/status", encoding="utf-8") as fh:
+            gids = next((ln.split()[1:] for ln in fh if ln.startswith("Groups:")), [])
+    except OSError:
+        return None
+    names = set()
+    for gid in gids:
+        _rc, line = _run(["getent", "group", gid])
+        names.add(line.split(":")[0] if line else gid)
+    return names
+
+
+def cmd_doctor(_args):
+    """Checks the usual reasons for a blank screen or dead buttons, and says what to do."""
+    fixes = []
+
+    def line(label, value, fix=None):
+        print(f"{label + ':':<22}{value}")
+        if fix:
+            fixes.append(fix)
+
+    model = ""
+    try:
+        with open(f"{ROOT}/proc/device-tree/model", encoding="utf-8", errors="replace") as fh:
+            model = fh.read().strip("\0\n ")
+    except OSError:
+        pass
+    codename = ""
+    try:
+        with open(f"{ROOT}/etc/os-release", encoding="utf-8") as fh:
+            codename = next((ln.split("=", 1)[1].strip().strip('"') for ln in fh if ln.startswith("VERSION_CODENAME=")), "")
+    except OSError:
+        pass
+    line("Pi", f"{model or 'unknown'}, Raspberry Pi OS {codename.capitalize() or '?'}")
+
+    path, lines = _config_txt()
+    for want, what in (("dtparam=spi=on", "the screen (SPI)"), ("dtoverlay=hifiberry-dac", "the sound chip"),
+                       ("gpio=25=op,dh", "the headphone amp")):
+        if path and want not in lines:
+            line(want, f"missing from {path}", f"Add '{want}' to {path} (for {what}), or run install.sh again, then reboot.")
+    spi = os.path.exists(f"{ROOT}/dev/spidev0.1")
+    if spi:
+        line("Screen connection", "SPI is on (/dev/spidev0.1)")
+    elif "dtparam=spi=on" in lines:
+        line("Screen connection", "SPI is set up but not on yet", "Reboot: sudo reboot")
+    else:
+        line("Screen connection", "SPI is off", "Run install.sh again (it switches SPI on), then reboot.")
+
+    _rc, mine = _run(["id", "-nG"])
+    mine = set(mine.split())
+    missing = [g for g in ("spi", "gpio") if g not in mine]
+    if missing:
+        line("Your groups", f"not in {' and '.join(missing)}", "Run install.sh again (it adds your user), then reboot.")
+    running = _service_groups()
+    active = _run(["systemctl", "--user", "is-active", "pirate-bluetooth"])[1] or "unknown"
+    enabled = _run(["systemctl", "--user", "is-enabled", "pirate-bluetooth"])[1] or "unknown"
+    line("Screen program", f"{active} ({enabled})",
+         None if active == "active" else "Start it: systemctl --user restart pirate-bluetooth (then check again)")
+    if running is not None and not missing and not {"spi", "gpio"} <= running:
+        line("Its groups", "started before your user joined spi/gpio", "Reboot: sudo reboot")
+    _rc, linger = _run(["loginctl", "show-user", os.environ.get("USER", ""), "-p", "Linger", "--value"])
+    if linger == "no":
+        line("Start at power-on", "off (only starts when you log in)", "Run install.sh again (it turns on 'linger').")
+
+    state = read_state_json("hardware.json")
+    if state:
+        age = int(time.time() - state.get("at", 0))
+        for part, label in (("display", "Screen"), ("buttons", "Buttons")):
+            value = state.get(part, "?")
+            line(label, "working" if value == "ok" else value,
+                 None if value in ("ok", "not in use") else
+                 f"{label}: see the reason above; 'pirate-bluetooth screen-test' tries it on its own and shows more.")
+        if age > 60 and active == "active":
+            print(f"{'':<22}(as of {age // 60} min ago)")
+    elif active == "active":
+        line("Screen", "the program hasn't reported yet (older version, or just started)")
+
+    argv = _mopidy_execstart()
+    own = mopidyconf.runs_own_screen(argv, mopidy_config_files(argv)) if argv else []
+    if own:
+        line("Mopidy", f"runs its own screen/buttons too ({', '.join(own)})",
+             "That's the --keep-pimoroni-screen setup. For the add-on's screen all the time, run install.sh again.")
+
+    rc, holders = _run(["gpioinfo"])
+    if rc == 0 and holders:
+        users = {}
+        for ln in holders.splitlines():  # libgpiod 1: line 13: "GPIO13" "st7789-bl" ...; 2: ... consumer="st7789-bl"
+            m = re.match(r"\s*line\s+(\d+):\s+\S+\s+(.*)", ln)
+            if not m or int(m.group(1)) not in (5, 6, 9, 13, 16, 20, 24):
+                continue
+            c = re.search(r'consumer="([^"]*)"', m.group(2)) or re.match(r'"([^"]*)"', m.group(2))
+            if c and c.group(1) not in ("", "unused"):
+                users[int(m.group(1))] = c.group(1)
+        if users:
+            line("Pins in use by", ", ".join(f"GPIO{k}: {v}" for k, v in sorted(users.items())))
+            ours = ("st7789", "pirate-bluetooth", "lg", "gpiozero")
+            others = sorted({v for v in users.values() if not v.startswith(ours)})
+            if others:
+                fixes.append(f"Another program has some of the Pirate Audio's pins ({', '.join(others)}). Stop it, or "
+                             "run install.sh again if it's Mopidy's PiDi/raspberry-gpio.")
+
+    _rc, recent = _run(["journalctl", "--user", "-u", "pirate-bluetooth", "-n", "300", "--no-pager", "-o", "cat"])
+    problems = [ln for ln in recent.splitlines()
+                if re.search(r"working yet|Drawing failed|Traceback|Error|couldn't start", ln)]
+    if problems:
+        print("\nRecent problems in its log:")
+        for ln in problems[-6:]:
+            print("  " + ln[:200])
+
+    print()
+    if fixes:
+        print("What to do:")
+        for fix in dict.fromkeys(fixes):
+            print("  - " + fix)
+    else:
+        print("Nothing wrong found. To see the screen and buttons on their own: pirate-bluetooth screen-test")
+    print("Full log: pirate-bluetooth logs screen")
+
+
+def read_state_json(name):
+    import json
+    try:
+        with open(os.path.expanduser(f"~/.local/state/pirate-bluetooth/{name}"), encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def cmd_screen_test(args):
+    """Stop the screen program, draw a test picture and show button presses, then start it again."""
+    venv_python = os.path.join(APP_DIR, "venv", "bin", "python")
+    if not os.path.exists(venv_python):
+        sys.exit("The add-on's Python environment is missing; run install.sh again.")
+    cfg = configparser.ConfigParser()
+    cfg.read(SETTINGS)
+    y_pin = cfg.get("buttons", "y_pin", fallback="24")
+    rotation = cfg.get("display", "rotation", fallback="90")
+    was_active = _run(["systemctl", "--user", "is-active", "pirate-bluetooth"])[1] == "active"
+    if was_active:
+        print("Stopping the screen program for the test...")
+        subprocess.run(["systemctl", "--user", "stop", "pirate-bluetooth"])
+    try:
+        rc = subprocess.run([venv_python, "-m", "pirate_bluetooth.screentest", str(args.seconds), y_pin, rotation],
+                            env=dict(os.environ, PYTHONPATH=APP_DIR)).returncode
+    finally:
+        if was_active:
+            print("Starting the screen program again.")
+            subprocess.run(["systemctl", "--user", "start", "pirate-bluetooth"])
+    if rc:
+        print("Something failed: `pirate-bluetooth doctor` checks the usual reasons.")
+    sys.exit(rc)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="pirate-bluetooth",
                                      description="Bluetooth controls for the Pirate Audio add-on")
@@ -317,11 +499,15 @@ def main(argv=None):
     lg.add_argument("-n", "--lines", type=int, default=60)
     lib = sub.add_parser("library", help="show or switch on Mopidy's music library (Mopidy-Local)")
     lib.add_argument("action", nargs="?", choices=["on"])
+    sub.add_parser("doctor", help="find out why the screen or buttons aren't working")
+    st = sub.add_parser("screen-test", help="draw a test picture and show button presses")
+    st.add_argument("seconds", nargs="?", type=float, default=15)
     args = parser.parse_args(argv)
 
     # These don't need Bluetooth itself
-    if args.cmd in ("latency", "logs", "library"):
-        {"latency": cmd_latency, "logs": cmd_logs, "library": cmd_library}[args.cmd](args)
+    if args.cmd in ("latency", "logs", "library", "doctor", "screen-test"):
+        {"latency": cmd_latency, "logs": cmd_logs, "library": cmd_library, "doctor": cmd_doctor,
+         "screen-test": cmd_screen_test}[args.cmd](args)
         return
 
     try:
