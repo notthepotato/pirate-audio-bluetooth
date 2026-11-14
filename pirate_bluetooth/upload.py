@@ -31,7 +31,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import mopidyconf
+from . import mopidyconf, playlist
 
 log = logging.getLogger("pirate_upload")
 
@@ -473,6 +473,9 @@ class Handler(BaseHTTPRequestHandler):
     scanner: LibraryScanner = None
     password = ""
     iris_port = 6680
+    index: playlist.LibraryIndex = None  # the Pi's songs, for the playlist check
+    picks: playlist.Picks = None
+    rpc = None  # Mopidy's JSON-RPC, for saving playlists
 
     def log_message(self, fmt, *args):
         log.debug("%s %s", self.address_string(), fmt % args)
@@ -677,16 +680,75 @@ class Handler(BaseHTTPRequestHandler):
             return
         if result["status"] == "saved" and result.get("kind") == "audio":
             self.scanner.request()
+            if self.index:
+                self.index.invalidate()
         self._send(200, result)
+
+    def _json_body(self, limit=2 * 2**20):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        if not 0 < length <= limit:
+            raise UploadError(400, "Missing or too big request.")
+        try:
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            raise UploadError(400, "That request wasn't understood.")
+        if not isinstance(body, dict):
+            raise UploadError(400, "That request wasn't understood.")
+        return body
 
     def do_POST(self):
         if not self._authorized():
             return
-        if urllib.parse.urlparse(self.path).path == "/api/scan" and self._same_origin():
+        path = urllib.parse.urlparse(self.path).path
+        if not self._same_origin():
+            self.close_connection = True
+            self._send(403, {"error": "This has to come from the music page."})
+        elif path == "/api/scan":
             self.scanner.request(delay=0)
             self._send(202, self.scanner.status())
+        elif path in ("/api/playlist/check", "/api/playlist/save"):
+            try:
+                body = self._json_body()
+                result = self._playlist_check(body) if path.endswith("check") else self._playlist_save(body)
+            except UploadError as err:
+                self._send(err.status, {"error": err.message})
+            except playlist.PlaylistError as err:
+                self._send(400, {"error": str(err)})
+            except Exception:
+                log.exception("Playlist %s failed", path.rsplit("/", 1)[-1])
+                self._send(500, {"error": "Something went wrong on the Pi; `pirate-bluetooth logs upload` has details."})
+            else:
+                self._send(200, result)
         else:
             self._send(404, {"error": "Not found"})
+
+    # -- playlist check --
+    def _playlist_check(self, body):
+        link = str(body.get("url", ""))[:2000]
+        result = playlist.check(link, self.index, self.picks)
+        log.info("Playlist check of %r: %d songs, %d on the Pi, %d to pick, %d missing", result["name"],
+                 len(result["tracks"]), result["counts"]["on_pi"], result["counts"]["choose"],
+                 result["counts"]["missing"])
+        return result
+
+    def _playlist_save(self, body):
+        changes = body.get("picks") or {}
+        if isinstance(changes, dict):
+            self.picks.update({str(k)[:300]: (str(v)[:2000] if v else None)
+                               for k, v in list(changes.items())[:5000]})
+        songs = [s for s in body.get("songs") or [] if isinstance(s, dict) and isinstance(s.get("uri"), str)]
+        known = {u for e in self.index.entries() for u in (e["uri"], e["local_uri"])}
+        songs = [s for s in songs if s["uri"] in known][:5000]  # only songs that really are on the Pi
+        if not songs:
+            raise UploadError(400, "None of the playlist's songs are on the Pi yet, so there's nothing to save.")
+        where, count, name = playlist.save_playlist(str(body.get("name", "")), songs, self.rpc,
+                                                    str(self.store.root))
+        log.info("Saved playlist %r with %d songs (%s)", name, count, where)
+        return {"saved": count, "name": name, "where": "mopidy" if where == "mopidy" else
+                where.replace(os.path.expanduser("~"), "~", 1)}
 
 
 def load_config(path):
@@ -737,6 +799,11 @@ def main(argv=None):
                                      mopidy_config_files(mopidy_argv) if mopidy_argv else None)
     Handler.password = up.get("password").strip()
     Handler.iris_port = mopidy_http_port()
+    rpc_url = cfg.get("mopidy", "rpc_url", fallback="") or f"http://127.0.0.1:{Handler.iris_port}/mopidy/rpc"
+    # (staticmethod: a plain function stored on the class would get "self" as its first argument)
+    Handler.rpc = staticmethod(playlist.mopidy_rpc(rpc_url))  # no Mopidy: calls fail, file names are used
+    Handler.index = playlist.LibraryIndex(up.get("music_dir"), Handler.rpc)
+    Handler.picks = playlist.Picks(os.path.expanduser("~/.local/state/pirate-bluetooth/playlist-picks.json"))
     port = args.port or up.getint("port")
 
     server = ThreadingHTTPServer((args.bind, port), Handler)

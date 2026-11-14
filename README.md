@@ -11,7 +11,9 @@ between your phone and the Pi's music.
 
 It also adds a **music page** for your PC or phone: open `http://raspberrypi.local:6681`, drop songs or whole
 album folders on it, and they go straight into the Pi's Music folder, ready to play in Mopidy. The same page
-lets you **download music from the Pi** back to your computer: single songs, whole folders, or everything.
+lets you **download music from the Pi** back to your computer (single songs, whole folders, or everything),
+and **check an Apple Music playlist**: which of its songs are already on the Pi, with a choice when it isn't
+clear, saved as a playlist for the Pi.
 
 **One script installs everything**, on Raspberry Pi OS **Trixie** or **Bookworm** (it works out which one it's
 on). On a fresh SD card it also sets up the Pi's music player (Mopidy with the Iris web page), so you don't
@@ -105,6 +107,32 @@ Open **`http://raspberrypi.local:6681`** in a browser on the same Wi-Fi. Use you
 - **When the uploads finish,** Mopidy's library refreshes by itself in the background, with no restart and no
   interruption. The songs show up in Iris under *Browse → Local media* (or *Files*). If Mopidy couldn't read a
   song, or its library is switched off, the page says so.
+
+### Check an Apple Music playlist
+
+Under **Check an Apple Music playlist**, paste a playlist's link (in the Music app: open the playlist, tap
+**⋯ → Share Playlist → Copy**) and click **Check**. The Pi reads the playlist's song list and compares it with
+the music on the Pi:
+
+- **On the Pi:** the song is there (by its artist and title tags, or its file and folder names), and the
+  page shows which file it found.
+- **Pick one:** something similar is there, but it might not be the same: another version (remix, VIP,
+  live, edit), a different spelling, no artist in the file name, or a different length. Pick the right
+  file, or **None of these**. **Change** on any ticked-off song lets you correct it too.
+- **Not on the Pi:** with links to get it. The **iTunes Store** link opens the song to buy it: bought songs
+  are normal, unprotected `.m4a` files (download them in the Apple Music app or iTunes on your PC), so you can
+  drop them on this page. **Bandcamp** sells a lot of music as WAV or FLAC, and on **SoundCloud** some
+  artists offer free downloads. The Pi doesn't download anything from these sites itself.
+
+**Save as a playlist on the Pi** makes a Mopidy playlist of the songs that are on the Pi, in the playlist's
+order: hold **A** → **Playlists** on the Pirate Audio, or find it in Iris. Your picks are remembered, and when
+you drop missing songs on the page, the check runs again by itself. Save again to update the playlist.
+
+Good to know: songs downloaded with an Apple Music subscription are copy-protected, so they can't be copied
+to the Pi (play those from your phone over Bluetooth). Apple has no official way to read playlists without
+a paid developer account, so this reads Apple's public web page for the playlist. Apple's page only lists
+roughly the first 100-300 songs of a long playlist (the page says so when that happens), and if Apple
+changes the page, the check says it can't read it until the add-on is updated.
 
 ### Download music from the Pi
 

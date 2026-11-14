@@ -102,6 +102,45 @@
     border-radius: 9px; color: var(--muted); border: 1px solid transparent; }
   a.get:hover { color: var(--accent); border-color: var(--line); background: var(--panel-2); }
   #browseNote { color: var(--muted); font-size: 13px; margin: 8px 2px 0; }
+
+  .sub { color: var(--muted); font-size: 13.5px; margin: -4px 0 12px; }
+  #plForm { display: flex; gap: 8px; }
+  #plForm input, #plName { flex: 1; min-width: 0; font: inherit; color: var(--text); background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 10px; padding: 9px 12px; }
+  #plForm input:focus, #plName:focus { outline: 2px solid color-mix(in srgb, var(--accent) 60%, transparent); outline-offset: 0; }
+  .err { color: var(--bad); font-size: 13.5px; margin-top: 10px; }
+  .plhead { display: flex; align-items: center; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+  #plName { font-weight: 600; flex: 1 1 220px; }
+  #plSummary { color: var(--muted); font-size: 13px; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; margin: 12px 0 4px; }
+  .chips button { font-size: 13px; font-weight: 500; padding: 4px 11px; border-radius: 999px; }
+  .chips button[aria-pressed=true] { border-color: var(--accent); color: var(--accent); }
+  .note { color: var(--warn); font-size: 13px; margin: 8px 0 0; }
+  #plList { list-style: none; margin: 6px 0 0; padding: 0; max-height: 70vh; overflow: auto; }
+  #plList > li { border-top: 1px solid var(--line); padding: 10px 2px; }
+  #plList > li:first-child { border-top: none; }
+  .pltop { display: grid; grid-template-columns: 2.2em 1fr auto; gap: 2px 8px; align-items: baseline; }
+  .pln { color: var(--faint); font-size: 12.5px; text-align: right; font-variant-numeric: tabular-nums; }
+  .plt { min-width: 0; }
+  .plt b { font-weight: 600; }
+  .plt .meta, .plmatch { color: var(--faint); font-size: 12.5px; }
+  .plmatch { grid-column: 2 / -1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tag { font-size: 12px; font-weight: 600; border-radius: 999px; padding: 2px 9px; white-space: nowrap;
+    border: 1px solid var(--line); color: var(--muted); }
+  .tag.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
+  .tag.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
+  .opts { margin: 8px 0 0 2.6em; display: flex; flex-direction: column; gap: 2px; }
+  .opts label { display: flex; gap: 9px; align-items: flex-start; padding: 6px 8px; border-radius: 8px; cursor: pointer; }
+  .opts label:hover { background: var(--panel-2); }
+  .opts input { margin-top: 3px; accent-color: var(--accent); flex: none; }
+  .opts .o1 { overflow-wrap: anywhere; }
+  .opts .o2 { display: block; color: var(--faint); font-size: 12.5px; }
+  .get-it { margin: 6px 0 0 2.6em; font-size: 13px; color: var(--muted); display: flex; gap: 4px 12px; flex-wrap: wrap; }
+  .get-it a { color: var(--accent); text-decoration: none; font-weight: 600; }
+  .get-it a:hover { text-decoration: underline; }
+  .plfoot { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 14px; }
+  #plSaved { color: var(--ok); font-size: 13.5px; }
+  #plSaved.bad { color: var(--bad); }
   .hidden { display: none !important; }
 </style>
 </head>
@@ -149,6 +188,24 @@
     <h2><span class="grow">Your music on the Pi</span><span class="pill" id="count">…</span></h2>
     <div id="library"><span class="dot" id="scanDot"></span><span id="scanText">Checking Mopidy's library…</span></div>
     <ul id="recent"></ul>
+  </section>
+
+  <section class="card" id="plCard">
+    <h2><span class="grow">Check an Apple Music playlist</span></h2>
+    <p class="sub">See which songs of a playlist are on the Pi, pick the right file when it isn't clear, and save
+      it as a playlist for the Pi. To get the link: in the Music app, open the playlist, tap ⋯ → Share Playlist → Copy.</p>
+    <form id="plForm">
+      <input id="plUrl" type="text" inputmode="url" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="https://music.apple.com/…/playlist/…" aria-label="Apple Music playlist link" required>
+      <button class="primary" id="plGo" type="submit">Check</button>
+    </form>
+    <div class="err hidden" id="plError" role="alert"></div>
+    <div class="hidden" id="plResult">
+      <div class="plhead"><input id="plName" aria-label="Name for the playlist on the Pi" maxlength="80"><span id="plSummary"></span></div>
+      <div class="chips" id="plFilter" role="group" aria-label="Show"></div>
+      <p class="note hidden" id="plNote"></p>
+      <ol id="plList"></ol>
+      <div class="plfoot"><button class="primary" id="plSave">Save as a playlist on the Pi</button><span id="plSaved" aria-live="polite"></span></div>
+    </div>
   </section>
 
   <section class="card" id="browseCard">
@@ -222,6 +279,121 @@ function watchScan() {
     if (s && !["waiting", "running"].includes(s.scan.state)) clearInterval(scanPoll);
   }, 2000);
 }
+
+// ---------- playlist check ----------
+let pl = null;                // the last check: {name, tracks, ...}
+let plUrl = "";
+let plFilter = "all";
+let plPicks = {};             // picks made here, not saved yet: key -> uri | "none"
+const STATUS = { on_pi: ["On the Pi", "ok"], choose: ["Pick one", "warn"], missing: ["Not on the Pi", ""] };
+function fmtLen(ms) { if (!ms) return ""; const s = Math.round(ms / 1000); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; }
+function rowState(t) {        // what this row is now, with picks made on this page applied
+  const p = plPicks[t.key];
+  if (p === "none") return { status: "missing", uri: null, picked: true };
+  if (p) { const c = t.candidates.find((c) => c.uri === p); if (c) return { status: "on_pi", uri: p, cand: c, picked: true }; }
+  if (t.status === "on_pi") return { status: "on_pi", uri: t.match.uri, cand: t.match, picked: !!t.picked };
+  return { status: t.status, uri: null, picked: !!t.picked };
+}
+async function checkPlaylist(url, quiet) {
+  const go = $("plGo"), err = $("plError");
+  if (!quiet) { go.disabled = true; go.textContent = "Checking…"; err.classList.add("hidden"); $("plSaved").textContent = ""; }
+  try {
+    const r = await fetch("/api/playlist/check", { method: "POST", headers: { "Content-Type": "application/json" },
+                                                   body: JSON.stringify({ url }) });
+    const data = await r.json().catch(() => ({ error: `The Pi answered ${r.status}.` }));
+    if (!r.ok || data.error) throw new Error(data.error || `The Pi answered ${r.status}.`);
+    const sameList = pl && plUrl === url;
+    pl = data; plUrl = url;
+    if (!sameList) { plPicks = {}; plFilter = data.counts.choose ? "choose" : "all"; $("plName").value = data.name; }
+    drawPlaylist();
+    $("plResult").classList.remove("hidden");
+  } catch (e) {
+    if (!quiet) { err.textContent = e.message === "Failed to fetch" ? "Lost the connection to the Pi." : e.message; err.classList.remove("hidden"); }
+  } finally { go.disabled = false; go.textContent = "Check"; }
+}
+function drawPlaylist() {
+  const rows = pl.tracks.map((t) => [t, rowState(t)]);
+  const n = (st) => rows.filter(([, s]) => s.status === st).length;
+  $("plSummary").textContent = `${n("on_pi")} of ${rows.length} on the Pi` + (n("choose") ? ` · ${n("choose")} to pick` : "") +
+    (n("missing") ? ` · ${n("missing")} not on the Pi` : "");
+  const chips = $("plFilter"); chips.replaceChildren();
+  for (const [id, label] of [["all", `All ${rows.length}`], ["choose", `To pick ${n("choose")}`], ["missing", `Not on the Pi ${n("missing")}`], ["on_pi", `On the Pi ${n("on_pi")}`]]) {
+    const b = el("button", "", label); b.type = "button"; b.setAttribute("aria-pressed", String(plFilter === id));
+    b.onclick = () => { plFilter = id; drawPlaylist(); }; chips.append(b);
+  }
+  const note = $("plNote"); note.textContent = pl.note || (pl.library === "files" && pl.songs_on_pi ?
+    "Mopidy's library wasn't available, so songs were matched by their file and folder names only." : "");
+  note.classList.toggle("hidden", !note.textContent);
+  const list = $("plList"); list.replaceChildren();
+  for (const [t, st] of rows) {
+    if (plFilter !== "all" && st.status !== plFilter) continue;
+    list.append(drawTrack(t, st));
+  }
+  if (!list.children.length) list.append(el("li", "meta", plFilter === "choose" ? "Nothing left to pick." : "None."));
+  const count = n("on_pi");
+  $("plSave").disabled = !count;
+  $("plSave").textContent = count ? `Save as a playlist on the Pi (${count} song${count === 1 ? "" : "s"})` : "Save as a playlist on the Pi";
+}
+function drawTrack(t, st) {
+  const li = el("li"), top = el("div", "pltop"), info = el("div", "plt");
+  info.append(el("b", "", t.title));
+  info.append(el("div", "meta", [t.artist, t.album, fmtLen(t.duration)].filter(Boolean).join(" · ")));
+  const [label, cls] = STATUS[st.status];
+  top.append(el("span", "pln", t.n), info, el("span", "tag " + cls, st.picked && st.status === "on_pi" ? "Your pick" : label));
+  li.append(top);
+  if (st.status === "on_pi" && st.cand) {
+    const m = el("div", "plmatch", "→ " + st.cand.path + (st.cand.note && st.cand.note !== "your pick" ? ` (${st.cand.note})` : ""));
+    m.title = st.cand.path; top.append(el("span"), m);
+  }
+  const open = st.status === "choose" || li.dataset.open === "1" || (plFilter !== "on_pi" && st.picked && st.status !== "on_pi" && t.candidates.length);
+  if (t.candidates.length && open) li.append(drawOptions(t, st));
+  else if (t.candidates.length) {
+    const b = el("button", "link", st.status === "on_pi" ? "Change" : "Pick a file on the Pi"); b.type = "button";
+    b.onclick = () => { b.replaceWith(drawOptions(t, rowState(t))); };
+    top.append(el("span"), b);
+  }
+  if (st.status !== "on_pi" && t.links) li.append(drawLinks(t));
+  return li;
+}
+function drawOptions(t, st) {
+  const box = el("div", "opts"); box.setAttribute("role", "radiogroup"); box.setAttribute("aria-label", "Which file is " + t.title);
+  const add = (value, main, sub) => {
+    const lab = el("label"), r = el("input"); r.type = "radio"; r.name = "pick-" + t.key; r.value = value;
+    r.checked = value === (st.uri || (st.status === "missing" && st.picked ? "none" : ""));
+    r.onchange = () => { plPicks[t.key] = value; $("plSaved").textContent = ""; drawPlaylist(); };
+    const tx = el("span"); tx.append(el("span", "o1", main)); if (sub) tx.append(el("span", "o2", sub));
+    lab.append(r, tx); box.append(lab);
+  };
+  for (const c of t.candidates)
+    add(c.uri, c.path, [c.title !== c.path ? c.title : "", c.artist, fmtLen(c.length), c.note].filter(Boolean).join(" · "));
+  add("none", "None of these", "Not on the Pi yet");
+  return box;
+}
+function drawLinks(t) {
+  const box = el("div", "get-it"); box.append("Get it:");
+  const link = (href, text, title) => { const a = el("a", "", text); a.href = href; a.target = "_blank"; a.rel = "noopener"; if (title) a.title = title; box.append(a); };
+  if (t.links.itunes) link(t.links.itunes, "iTunes Store" + (t.links.price ? ` (${t.links.price})` : ""), "Bought songs are normal files you can drop on this page");
+  link(t.links.bandcamp, "Bandcamp", "Often sold as WAV or FLAC");
+  link(t.links.soundcloud, "SoundCloud", "Some artists offer free downloads");
+  return box;
+}
+$("plForm").onsubmit = (e) => { e.preventDefault(); checkPlaylist($("plUrl").value.trim()); };
+$("plSave").onclick = async () => {
+  const songs = [];
+  for (const t of pl.tracks) { const st = rowState(t); if (st.status === "on_pi") songs.push({ key: t.key, uri: st.uri, title: t.title, artist: t.artist }); }
+  const out = $("plSaved"); out.className = ""; out.textContent = "Saving…"; $("plSave").disabled = true;
+  try {
+    const r = await fetch("/api/playlist/save", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: $("plName").value.trim() || pl.name, songs, picks: plPicks }) });
+    const data = await r.json().catch(() => ({ error: `The Pi answered ${r.status}.` }));
+    if (!r.ok || data.error) throw new Error(data.error);
+    out.textContent = data.where === "mopidy"
+      ? `Saved “${data.name}” with ${data.saved} songs: hold A on the Pirate Audio → Playlists, or find it in Iris.`
+      : `Saved “${data.name}” with ${data.saved} songs as ${data.where}.`;
+    for (const t of pl.tracks) if (plPicks[t.key]) t.picked = true;
+  } catch (e) { out.className = "bad"; out.textContent = e.message || "Couldn't save the playlist."; }
+  finally { $("plSave").disabled = false; }
+};
 
 // ---------- browsing and downloading ----------
 const ICONS = {
@@ -430,7 +602,10 @@ function updateSummary() {
 }
 function finished() {
   updateSummary();
-  if (queue.some((q) => q.state === "saved")) { refreshStatus(); watchScan(); browse(browsePath, "none"); }
+  if (queue.some((q) => q.state === "saved")) {
+    refreshStatus(); watchScan(); browse(browsePath, "none");
+    if (pl) setTimeout(() => checkPlaylist(plUrl, true), 1500);  // new songs may complete the playlist
+  }
 }
 
 // ---------- wiring ----------
