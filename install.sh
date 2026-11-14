@@ -6,6 +6,7 @@
 #   bash install.sh --check     look at the system and say what would change, without changing anything
 #   bash install.sh             install (asks before changing anything)
 #   bash install.sh --name "Kite's Pirate" --y-pin 20 -y
+#   bash install.sh --latency low    (less delay; see "pirate-bluetooth latency" to change it later)
 #
 # Run it as your normal user (not with sudo). It asks for your password when it needs it.
 set -euo pipefail
@@ -18,6 +19,7 @@ RECORD="$CONF_DIR/.install-record"
 ROOT="${PIRATE_TEST_ROOT:-}"  # only set by the test suite, to run against a fake filesystem
 MAIN_CONF="$ROOT/etc/bluetooth/main.conf"
 ASOUND_CONF="$ROOT/etc/asound.conf"
+LATENCY_FILE="$ROOT/etc/default/pirate-bluetooth-latency"
 UNIT_DIR="$ROOT/etc/systemd/system"
 BIN_DIR="$ROOT/usr/local/bin"
 DATESTAMP="$(date "+%Y-%m-%d-%H-%M-%S")"
@@ -28,6 +30,7 @@ NAME="Pirate Audio"
 Y_PIN=24
 UPLOAD=true
 UPLOAD_PORT=6681
+LATENCY=""  # empty: keep the current setting (or "normal" on a first install)
 ASSUME_YES=false
 CHECK_ONLY=false
 REBOOT_NEEDED=false
@@ -48,6 +51,8 @@ Usage: bash install.sh [options]
   --y-pin 20       Use BCM 20 for the Y button (Pirate Audio boards made before 23 Jan 2020).
   --upload-port N  Port for the music upload page (default 6681).
   --no-upload      Don't install the music upload page.
+  --latency LEVEL  How far the sound lags behind the phone: low (~0.1 s buffered on the Pi),
+                   normal (~0.2 s, default) or safe (~0.5 s, BlueALSA's own default).
   -y, --yes        Don't ask for confirmation.
   -h, --help       Show this help.
 EOF
@@ -61,6 +66,8 @@ while [ $# -gt 0 ]; do
         --y-pin) shift; Y_PIN="${1:-}" ;;
         --upload-port) shift; UPLOAD_PORT="${1:-}" ;;
         --no-upload) UPLOAD=false ;;
+        --latency) shift; LATENCY="${1:-}" ;;
+        --latency=*) LATENCY="${1#--latency=}" ;;
         -y|--yes) ASSUME_YES=true ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; fatal "Unknown option: $1" ;;
@@ -73,6 +80,16 @@ done
 record() { mkdir -p "$CONF_DIR"; printf '%s=%q\n' "$1" "$2" >> "$RECORD"; }
 record_add() { mkdir -p "$CONF_DIR"; printf '%s+=%q\n' "$1" " $2" >> "$RECORD"; }
 installed() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed"; }
+# Playback buffer for bluealsa-aplay (microseconds). It starts playing once the buffer is full, so the
+# buffer size is the delay added on the Pi. Smaller = less lag, but more chance of crackles when the
+# radio is busy (e.g. big Wi-Fi transfers). Keep in step with LATENCY_LEVELS in pirate_bluetooth/cli.py.
+latency_opts() {
+    case "$1" in
+        low) echo "--pcm-buffer-time=100000 --pcm-period-time=20000" ;;
+        normal) echo "--pcm-buffer-time=200000 --pcm-period-time=40000" ;;
+        safe) echo "--pcm-buffer-time=500000 --pcm-period-time=100000" ;;
+    esac
+}
 
 # ============================================================================================
 #  1. Look before touching anything
@@ -85,6 +102,7 @@ NOTES=()
 command -v apt-get >/dev/null || fatal "This installer is for Raspberry Pi OS."
 [[ "$NAME" =~ ^[A-Za-z0-9\ ._\(\)\'-]{1,40}$ ]] || fatal "--name must be 1-40 letters, numbers, spaces or . _ ( ) ' -"
 [[ "$Y_PIN" =~ ^(20|24)$ ]] || fatal "--y-pin must be 20 or 24"
+[[ -z "$LATENCY" || "$LATENCY" =~ ^(low|normal|safe)$ ]] || fatal "--latency must be low, normal or safe"
 [[ "$UPLOAD_PORT" =~ ^[0-9]+$ ]] && [ "$UPLOAD_PORT" -ge 1024 ] && [ "$UPLOAD_PORT" -le 65535 ] \
     || fatal "--upload-port must be a number from 1024 to 65535"
 systemctl --user show-environment >/dev/null 2>&1 \
@@ -185,14 +203,25 @@ if systemctl --user cat mopidy >/dev/null 2>&1; then
 fi
 MOPIDY_PORT="${MOPIDY_PORT:-6680}"
 
+# User services (Mopidy, and the screen program) normally start only when you log in. "Linger" starts
+# them at power-on instead, which Pimoroni suggests for Mopidy too; without it, pressing play and the
+# phone reconnecting by itself wouldn't work until someone logs in.
 LINGER="$(loginctl show-user "$USER" -p Linger --value 2>/dev/null || echo unknown)"
-if [ "$LINGER" != "yes" ]; then
-    NOTES+=("The screen program starts with your user services, the same way Mopidy does. Bluetooth audio
-      itself works from power-on either way.")
+LINGER_ACTION="none"
+if [ "$LINGER" = "no" ]; then
+    LINGER_ACTION="enable"
+    CHANGES+=("start your user services (Mopidy and this add-on) at power-on instead of at login
+      ('loginctl enable-linger', as Pimoroni suggests for Mopidy; uninstall.sh turns it back off)")
+elif [ "$LINGER" != "yes" ]; then
+    NOTES+=("Couldn't check whether your user services start at power-on (loginctl). If the screen program
+      only starts after you log in, run: sudo loginctl enable-linger $USER")
 fi
 
 CHANGES+=("add BlueALSA services 'pirate-bluealsa' and 'pirate-bluealsa-aplay' (receive phone audio, play it on the Pirate Audio)")
 CHANGES+=("add a 'Pirate Headphone' volume control to $ASOUND_CONF (a marked block; backed up)")
+if [ -n "$LATENCY" ] || [ ! -f "$LATENCY_FILE" ]; then
+    CHANGES+=("set the Bluetooth audio delay to '${LATENCY:-normal}' in $LATENCY_FILE")
+fi
 CHANGES+=("install the screen/buttons program to $APP_DIR (its own Python environment) as user service 'pirate-bluetooth'")
 CHANGES+=("add the 'pirate-bluetooth' command to $BIN_DIR")
 if $UPLOAD; then
@@ -225,7 +254,7 @@ else
 fi
 echo
 echo "Not changed: Mopidy and its settings, the default sound output, other sound cards, your Wi-Fi,"
-echo "             how/when your user services start, and anything already installed (no upgrades)."
+echo "             and anything already installed (no upgrades)."
 echo
 echo "Will change:"
 for item in "${CHANGES[@]}"; do echo "  - $item"; done
@@ -333,6 +362,13 @@ fi
 sed "s/@CARD@/$CARD/g" "$SCRIPT_DIR/config/asound-pirate.conf" | sudo tee -a "$ASOUND_CONF" >/dev/null
 
 step "Bluetooth audio services"
+if [ -n "$LATENCY" ] || [ ! -f "$LATENCY_FILE" ]; then
+    LEVEL="${LATENCY:-normal}"
+    sudo mkdir -p "$(dirname "$LATENCY_FILE")"
+    printf '%s\n' "# Written by the Pirate Audio Bluetooth add-on. Change with: pirate-bluetooth latency low|normal|safe" \
+        "PIRATE_LATENCY=$LEVEL" "PIRATE_LATENCY_OPTS=\"$(latency_opts "$LEVEL")\"" \
+        | sudo tee "$LATENCY_FILE" >/dev/null
+fi
 for unit in pirate-bluealsa pirate-bluealsa-aplay; do
     sed -e "s#@BLUEALSA@#$BLUEALSA_BIN#" -e "s#@APLAY@#$APLAY_BIN#" -e "s#@CARD@#$CARD#" \
         "$SCRIPT_DIR/systemd/$unit.service" | sudo tee "$UNIT_DIR/$unit.service" >/dev/null
@@ -385,6 +421,11 @@ for group in spi gpio audio; do
 done
 systemctl --user daemon-reload
 systemctl --user enable pirate-bluetooth
+if [ "$LINGER_ACTION" = "enable" ]; then
+    inform "Starting your user services (Mopidy and the add-on) at power-on"
+    sudo loginctl enable-linger "$USER"
+    record LINGER_ENABLED_BY_US yes
+fi
 if ! $REBOOT_NEEDED; then
     systemctl --user restart pirate-bluetooth
 fi
@@ -406,8 +447,9 @@ echo "  1. The Pirate Audio screen shows 'Pairing mode' (if not: hold A, then pr
 echo "  2. On the iPhone: Settings > Bluetooth, tap \"$NAME\"."
 echo "  3. When both screens show the same 6-digit code, press A on the Pirate Audio and tap Pair on the iPhone."
 echo
-echo "After that it works like headphones: pick \"$NAME\" in Control Center and play anything,"
-echo "including songs downloaded for offline listening."
+echo "After that it works like headphones: it connects to your iPhone by itself when you switch it on"
+echo "(or pick \"$NAME\" in Control Center), and plays anything, including songs downloaded for offline"
+echo "listening. Right after power-on, A plays whatever you used last: your phone or the Pi's own music."
 echo
 echo "Buttons while your phone plays:  A play/pause (hold: info)   X next (hold: previous)   B/Y volume"
 if $UPLOAD; then

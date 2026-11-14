@@ -215,7 +215,9 @@ class Renderer:
         artist_font = self.fonts.get(16, text=view.artist)
         small = self.fonts.get(11)
 
-        if view.phone:
+        if view.choice and not view.playing:  # just switched on: A plays the phone, X the Pi's music
+            self._legend(d, top_left="play", top_right="Pi music")
+        elif view.phone:
             f = self.fonts.get(11, text=view.phone)
             d.text((margin, 10), _ellipsize(d, view.phone, f, width), font=f, fill=SUBTLE)
         title = _ellipsize(d, view.title or view.album or "Unknown track", title_font, width)
@@ -241,17 +243,28 @@ class Renderer:
     def _idle(self, view: View) -> Image.Image:
         frame = _vertical_gradient((24, 30, 48), BG)
         d = ImageDraw.Draw(frame)
-        self._headphones_icon(d, 120, 62, BLUE)
-        self._centered(d, "Bluetooth ready", 112, self.fonts.get(20, bold=True), TEXT)
-        name_font = self.fonts.get(16, text=view.name)
-        self._centered(d, _ellipsize(d, view.name, name_font, 220), 140, name_font, BLUE)
         hint = self.fonts.get(12)
-        if view.last_phone:
-            self._centered(d, "Pick it in your phone's Bluetooth", 180, hint, FAINT)
-            self._centered(d, "or press A to reconnect", 197, hint, FAINT)
+        if view.connecting:
+            self._phone_icon(d, 108, 62, BLUE)
+            self._centered(d, "Connecting…", 112, self.fonts.get(20, bold=True), TEXT)
+            phone = view.last_phone or "your phone"
+            f = self.fonts.get(16, text=phone)
+            self._centered(d, _ellipsize(d, phone, f, 220), 140, f, BLUE)
+            self._centered(d, "Make sure your phone's", 180, hint, FAINT)
+            self._centered(d, "Bluetooth is on", 197, hint, FAINT)
         else:
-            self._centered(d, "No phone paired yet:", 180, hint, FAINT)
-            self._centered(d, "hold A, then press X to pair", 197, hint, FAINT)
+            self._headphones_icon(d, 120, 62, BLUE)
+            self._centered(d, "Bluetooth ready", 112, self.fonts.get(20, bold=True), TEXT)
+            name_font = self.fonts.get(16, text=view.name)
+            self._centered(d, _ellipsize(d, view.name, name_font, 220), 140, name_font, BLUE)
+            if view.last_phone:
+                self._centered(d, "Pick it in your phone's Bluetooth", 180, hint, FAINT)
+                self._centered(d, "or press A to reconnect", 197, hint, FAINT)
+            else:
+                self._centered(d, "No phone paired yet:", 180, hint, FAINT)
+                self._centered(d, "hold A, then press X to pair", 197, hint, FAINT)
+        if view.choice:
+            self._legend(d, top_left="play", top_right="Pi music")
         return frame
 
     def _connected(self, view: View) -> Image.Image:
@@ -262,7 +275,9 @@ class Renderer:
         if view.phone:
             f = self.fonts.get(14, text=view.phone)
             self._centered(d, _ellipsize(d, view.phone, f, 220), 148, f, SUBTLE)
-        self._centered(d, "Play something on your phone", 190, self.fonts.get(12), FAINT)
+        self._centered(d, "Press A, or play on your phone", 190, self.fonts.get(12), FAINT)
+        if view.choice:
+            self._legend(d, top_left="play", top_right="Pi music")
         return frame
 
     def _pairing(self, view: View) -> Image.Image:

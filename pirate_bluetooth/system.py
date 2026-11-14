@@ -120,6 +120,50 @@ class MopidyUnavailable(Exception):
     pass
 
 
+BOOT_ID_FILE = "/proc/sys/kernel/random/boot_id"
+QUEUE_SAVE_EVERY_S = 30  # while Mopidy plays, how often the position is written down (for power cuts)
+
+
+def boot_id() -> str:
+    """Changes every time the Pi boots, so saved state can tell "after a reboot" from "same session"."""
+    try:
+        with open(os.environ.get("PIRATE_BOOT_ID_FILE", BOOT_ID_FILE), encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def uptime() -> float:
+    """Seconds since the Pi booted."""
+    try:
+        with open(os.environ.get("PIRATE_UPTIME_FILE", "/proc/uptime"), encoding="utf-8") as fh:
+            return float(fh.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return float("inf")
+
+
+def write_json(path, data) -> bool:
+    """Write a small state file safely: a power cut mid-write leaves the old file, never half a file."""
+    tmp = f"{path}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, path)
+        return True
+    except OSError as err:
+        log.warning("Couldn't save %s: %s", path, err)
+        return False
+
+
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
 class MopidyHandoff:
     """Shares the screen and buttons with Pimoroni's Mopidy setup (Mopidy-PiDi + raspberry-gpio).
 
@@ -127,24 +171,46 @@ class MopidyHandoff:
     the DAC) and start it again afterwards - but only if it was running before. Mopidy's configuration is
     never touched. Because a restart would empty Mopidy's queue, we save the queue, current track,
     position, repeat/shuffle and volume over Mopidy's own JSON-RPC API first, and put them back after.
+
+    The same saved queue also carries Mopidy over reboots: while Mopidy runs, `watch_step()` keeps
+    `queue_file` up to date, and when Mopidy comes up empty after the Pi starts, the queue is put back
+    (paused where it was), so pressing play after power-on plays something.
     """
 
     def __init__(self, mode="auto", unit="mopidy", rpc_url="http://127.0.0.1:6680/mopidy/rpc",
-                 state_file=None, ready_timeout=180):
+                 state_file=None, queue_file=None, ready_timeout=180):
         self.mode = mode
         self.unit = unit
         self.rpc_url = rpc_url
         self.state_file = state_file
+        self.queue_file = queue_file
         self.ready_timeout = ready_timeout
         self._stopped_it = False
         self._snapshot = None
         self._enabled = None
         self._restore_thread = None
+        self._lock = threading.Lock()  # one of take() / boot restore / queue saving at a time
+        self._boot = boot_id()
+        saved = self._read_queue()
+        # Saved during an earlier boot and not empty: put it back once Mopidy is up (if it comes up empty).
+        self.boot_restore_pending = bool(saved and saved.get("boot_id") != self._boot
+                                         and (saved.get("snapshot") or {}).get("uris"))
+        self._watch_key = None
+        self._watch_saved_at = 0.0
+        self._watch_snap = None
         # Talk to Mopidy directly, never through an HTTP proxy from the environment.
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def _systemctl(self, *args, timeout=30):
         return _run(["systemctl", "--user", *args, self.unit], timeout=timeout)
+
+    @property
+    def stopped_by_us(self) -> bool:
+        return self._stopped_it
+
+    @property
+    def busy(self) -> bool:
+        return self._stopped_it or bool(self._restore_thread and self._restore_thread.is_alive())
 
     # -- Mopidy's JSON-RPC API ----------------------------------------------------------
     def rpc(self, method, timeout=3.0, **params):
@@ -160,7 +226,7 @@ class MopidyHandoff:
             raise MopidyUnavailable(f"{method}: {reply['error'].get('message', reply['error'])}")
         return reply.get("result")
 
-    def snapshot(self):
+    def snapshot(self, quiet=False):
         """Queue, current track, position, options and volume - or None if Mopidy doesn't answer."""
         try:
             tl_tracks = self.rpc("core.tracklist.get_tl_tracks", timeout=10) or []
@@ -178,10 +244,12 @@ class MopidyHandoff:
             for opt in ("repeat", "random", "single", "consume"):
                 snap[opt] = bool(self.rpc(f"core.tracklist.get_{opt}"))
         except (MopidyUnavailable, KeyError, TypeError) as err:
-            log.warning("Couldn't save Mopidy's queue (%s); it will start empty", err)
+            if not quiet:
+                log.warning("Couldn't read Mopidy's queue (%s)", err)
             return None
-        log.info("Saved Mopidy state: %d queued, %s at %d ms", len(snap["uris"]), snap["state"],
-                 snap["position"])
+        if not quiet:
+            log.info("Saved Mopidy state: %d queued, %s at %d ms", len(snap["uris"]), snap["state"],
+                     snap["position"])
         return snap
 
     def _wait_until_ready(self) -> bool:
@@ -194,9 +262,9 @@ class MopidyHandoff:
                 time.sleep(1)
         return False
 
-    def restore(self, snap):
-        """Blocking: wait for Mopidy to come back, then put the saved state back."""
-        if not self._wait_until_ready():
+    def restore(self, snap, wait=True):
+        """Blocking: wait for Mopidy to come back, then put the saved state back (paused, silently)."""
+        if wait and not self._wait_until_ready():
             log.warning("Mopidy didn't come back within %d s; not restoring its queue", self.ready_timeout)
             return
         try:
@@ -240,16 +308,77 @@ class MopidyHandoff:
         finally:
             self._clear_state()
 
+    # -- the queue kept across reboots ---------------------------------------------------------------
+    def _read_queue(self):
+        data = read_json(self.queue_file) if self.queue_file else None
+        return data if isinstance(data, dict) else None
+
+    def _write_queue(self, snap, boot=None):
+        if self.queue_file and snap is not None:
+            write_json(self.queue_file, {"boot_id": self._boot if boot is None else boot,
+                                         "saved_at": time.time(), "snapshot": snap})
+
+    def _saved_from_earlier_boot(self):
+        """The queue saved before this boot, if it hasn't been put back yet."""
+        if not self.boot_restore_pending:
+            return None
+        saved = self._read_queue()
+        return (saved or {}).get("snapshot")
+
+    def watch_step(self):
+        """Call every few seconds from a worker thread while Mopidy may be running. Keeps the saved queue
+        current, puts it back after a reboot, and returns Mopidy's playback state ("playing", ...) or
+        None when Mopidy isn't reachable or is busy being handed over."""
+        if not self.enabled or self.busy or not self._lock.acquire(blocking=False):
+            return None
+        try:
+            if self.busy:
+                return None
+            try:
+                key = (self.rpc("core.tracklist.get_version", timeout=2),
+                       self.rpc("core.playback.get_state", timeout=2),
+                       self.rpc("core.playback.get_current_tlid", timeout=2),
+                       self.rpc("core.mixer.get_volume", timeout=2))
+            except MopidyUnavailable:
+                return None
+            if self.boot_restore_pending:
+                snap = self._saved_from_earlier_boot()
+                self.boot_restore_pending = False
+                if snap and key[0] is not None:
+                    log.info("Mopidy started after power-on: putting its queue back")
+                    self.restore(snap, wait=False)  # leaves it alone if Mopidy already has a queue
+                    return None  # report nothing this round: the restore played (muted) for a moment
+            now = time.monotonic()
+            if key != self._watch_key:
+                snap = self.snapshot(quiet=True)
+                if snap is not None:
+                    self._write_queue(snap)
+                    self._watch_key, self._watch_snap, self._watch_saved_at = key, snap, now
+            elif key[1] == "playing" and now - self._watch_saved_at >= QUEUE_SAVE_EVERY_S and self._watch_snap:
+                try:
+                    self._watch_snap["position"] = self.rpc("core.playback.get_time_position", timeout=2) or 0
+                except MopidyUnavailable:
+                    return None
+                self._write_queue(self._watch_snap)
+                self._watch_saved_at = now
+            return key[1]
+        finally:
+            self._lock.release()
+
+    def save_now(self):
+        """At shutdown: write down exactly where Mopidy is, if it's running and ours to read."""
+        if not self.enabled or self.busy or self.boot_restore_pending:
+            return
+        with self._lock:
+            snap = self.snapshot(quiet=True)
+            if snap is not None:
+                self._write_queue(snap)
+                log.info("Saved Mopidy's queue for next time (%d tracks)", len(snap["uris"]))
+
     # -- remembering that we stopped Mopidy, in case this program is restarted ---------------------
     def _write_state(self, data):
-        if not self.state_file:
-            return
-        try:
-            os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
-            with open(self.state_file, "w", encoding="utf-8") as fh:
-                json.dump(data, fh)
-        except OSError as err:
-            log.warning("Couldn't save %s: %s", self.state_file, err)
+        if self.state_file:
+            write_json(self.state_file, data)
 
     def _clear_state(self):
         if self.state_file:
@@ -259,21 +388,26 @@ class MopidyHandoff:
                 pass
 
     def recover(self) -> bool:
-        """At start-up: did a previous run stop Mopidy and not start it again? Then we owe it a restart."""
+        """At start-up: did a previous run stop Mopidy and not start it again? Then we owe it a restart.
+
+        After a reboot we don't: Mopidy starts by itself at boot, and its saved queue is put back from
+        the queue file instead."""
         if not self.state_file or not os.path.exists(self.state_file):
             return False
-        try:
-            with open(self.state_file, encoding="utf-8") as fh:
-                data = json.load(fh)
-        except (OSError, ValueError):
+        data = read_json(self.state_file)
+        if not isinstance(data, dict) or not data.get("stopped_by_us"):
             self._clear_state()
             return False
-        if data.get("stopped_by_us"):
-            log.info("A previous run stopped Mopidy; it will be started again")
-            self._stopped_it = True
-            self._snapshot = data.get("snapshot")
-            return True
-        return False
+        if data.get("boot_id", self._boot) != self._boot:
+            if data.get("snapshot") is not None:
+                self._write_queue(data["snapshot"], boot=data.get("boot_id"))
+                self.boot_restore_pending = bool(data["snapshot"].get("uris"))
+            self._clear_state()
+            return False
+        log.info("A previous run stopped Mopidy; it will be started again")
+        self._stopped_it = True
+        self._snapshot = data.get("snapshot")
+        return True
 
     @property
     def enabled(self) -> bool:
@@ -294,18 +428,38 @@ class MopidyHandoff:
             return
         if self._restore_thread and self._restore_thread.is_alive():
             self._restore_thread.join(timeout=self.ready_timeout + 30)  # let a restart finish first
-        for _ in range(60):  # don't race a Mopidy that is still starting up
-            res = self._systemctl("is-active", timeout=5)
-            if not res or res.stdout.strip() not in ("activating", "reloading"):
-                break
-            time.sleep(1)
-        if res and res.returncode == 0:
-            snap = self.snapshot()
-            self._write_state({"stopped_by_us": True, "snapshot": snap})
+        with self._lock:
+            for _ in range(60):  # don't race a Mopidy that is still starting up
+                res = self._systemctl("is-active", timeout=5)
+                if not res or res.stdout.strip() not in ("activating", "reloading"):
+                    break
+                time.sleep(1)
+            if not (res and res.returncode == 0):
+                return
+            snap = self.snapshot(quiet=self.boot_restore_pending)  # just after boot it may not answer yet
+            earlier = self._saved_from_earlier_boot()
+            if earlier and (snap is None or not snap["uris"]):
+                # Mopidy has only just started after power-on: carry over the queue from before the reboot.
+                log.info("Using Mopidy's queue from before the reboot")
+                snap = earlier
+            elif snap is None:
+                snap = (self._read_queue() or {}).get("snapshot")
+                if snap:
+                    log.info("Mopidy didn't answer; using its last saved queue")
+            self.boot_restore_pending = False
+            if snap and snap.get("state") in ("playing", "paused"):
+                try:  # let go of the DAC right away, so the phone's audio isn't held up while Mopidy exits
+                    self.rpc("core.playback.stop", timeout=2)
+                except MopidyUnavailable:
+                    pass
+            self._write_state({"stopped_by_us": True, "snapshot": snap, "boot_id": self._boot})
+            if snap is not None:
+                self._write_queue(snap)
             log.info("Stopping %s while Bluetooth has the screen", self.unit)
             self._systemctl("stop")
             self._stopped_it = True
             self._snapshot = snap
+            self._watch_key = None
 
     def wait_restore(self, timeout: float) -> None:
         if self._restore_thread and self._restore_thread.is_alive():
@@ -317,10 +471,19 @@ class MopidyHandoff:
             return
         log.info("Starting %s again", self.unit)
         self._systemctl("start", "--no-block", timeout=10)
-        self._stopped_it = False
         snap, self._snapshot = self._snapshot, None
         self._restore_thread = threading.Thread(target=self.restore, args=(snap,), daemon=True)
         self._restore_thread.start()
+        self._stopped_it = False
+
+
+def shutting_down() -> bool:
+    """Is the Pi shutting down or rebooting (or the user's session ending)? Then don't restart things."""
+    for scope in (["--user"], []):
+        res = _run(["systemctl", *scope, "is-system-running"], timeout=5)
+        if res and res.stdout.strip() == "stopping":
+            return True
+    return False
 
 
 def local_ip() -> str:

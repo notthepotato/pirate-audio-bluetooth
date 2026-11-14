@@ -9,7 +9,10 @@ After=pirate-bluealsa.service sound.target
 
 [Service]
 Type=simple
-ExecStart=@APLAY@ --pcm=pirate_out --mixer-device=hw:@CARD@ "--mixer-name=Pirate Headphone" --single-audio
+# How much audio is buffered on the Pi, i.e. how far the sound lags behind the phone.
+# Change it with:  pirate-bluetooth latency low|normal|safe
+EnvironmentFile=-/etc/default/pirate-bluetooth-latency
+ExecStart=@APLAY@ $PIRATE_LATENCY_OPTS --pcm=pirate_out --mixer-device=hw:@CARD@ "--mixer-name=Pirate Headphone" --single-audio
 Restart=on-failure
 RestartSec=2
 CapabilityBoundingSet=

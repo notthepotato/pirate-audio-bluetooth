@@ -18,6 +18,16 @@ BLUEZ = "org.bluez"
 ADAPTER = "org.bluez.Adapter1"
 DEVICE = "org.bluez.Device1"
 SETTINGS = os.path.expanduser("~/.config/pirate-bluetooth/settings.ini")
+# Read by the pirate-bluealsa-aplay service. PIRATE_TEST_ROOT is only set by the test suite.
+LATENCY_FILE = os.environ.get("PIRATE_TEST_ROOT", "") + "/etc/default/pirate-bluetooth-latency"
+APLAY_UNIT = "pirate-bluealsa-aplay"
+# bluealsa-aplay's playback buffer (microseconds): it starts playing once the buffer is full, so this is
+# the delay the Pi adds. Keep in step with latency_opts() in install.sh.
+LATENCY_LEVELS = {  # buffer µs, period µs, delay on the Pi, note
+    "low": (100000, 20000, "about 0.1 s on the Pi", "snappiest; may crackle while Wi-Fi is busy"),
+    "normal": (200000, 40000, "about 0.2 s on the Pi", "the default"),
+    "safe": (500000, 100000, "about 0.5 s on the Pi", "BlueALSA's own default; most robust"),
+}
 
 
 class Bluez:
@@ -57,6 +67,45 @@ def upload_port():
     return cfg.getint("upload", "port", fallback=6681)
 
 
+def current_latency():
+    try:
+        with open(LATENCY_FILE, encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("PIRATE_LATENCY="):
+                    level = line.split("=", 1)[1].strip()
+                    if level in LATENCY_LEVELS:
+                        return level
+    except OSError:
+        pass
+    return "safe"  # no setting: bluealsa-aplay uses its built-in 0.5 s buffer
+
+
+def cmd_latency(args):
+    if not args.level:
+        now = current_latency()
+        print(f"Bluetooth delay: {now} ({LATENCY_LEVELS[now][2]})")
+        print()
+        print("Change it with:  pirate-bluetooth latency low|normal|safe")
+        for level, (_b, _p, delay, note) in LATENCY_LEVELS.items():
+            print(f"  {level:<7} {delay}: {note}")
+        print("Your phone and the Bluetooth link add roughly another 0.1-0.2 s that the Pi can't change.")
+        return
+    buffer_us, period_us, delay, _note = LATENCY_LEVELS[args.level]
+    content = ("# Written by the Pirate Audio Bluetooth add-on. Change with: pirate-bluetooth latency low|normal|safe\n"
+               f"PIRATE_LATENCY={args.level}\n"
+               f'PIRATE_LATENCY_OPTS="--pcm-buffer-time={buffer_us} --pcm-period-time={period_us}"\n')
+    print("Changing the Bluetooth audio delay needs your password (sudo).")
+    res = subprocess.run(["sudo", "tee", LATENCY_FILE], input=content, text=True, stdout=subprocess.DEVNULL)
+    if res.returncode != 0:
+        sys.exit(f"Couldn't write {LATENCY_FILE}")
+    res = subprocess.run(["sudo", "systemctl", "restart", APLAY_UNIT])
+    if res.returncode != 0:
+        sys.exit(f"Saved, but restarting {APLAY_UNIT} failed. Try: sudo systemctl restart {APLAY_UNIT}")
+    print(f"Bluetooth delay is now {args.level} ({delay}).")
+    if args.level == "low":
+        print("If you hear crackles or dropouts, go back with:  pirate-bluetooth latency normal")
+
+
 def name_of(dev):
     return dev.get("Alias") or dev.get("Name") or dev.get("Address", "?")
 
@@ -73,6 +122,8 @@ def cmd_status(bz, _args):
         label = "Paired phones:  " if i == 0 else "                "
         state = "connected" if dev.get("Connected") else "not connected"
         print(f"{label} {name_of(dev)} ({state})")
+    level = current_latency()
+    print(f"{'Bluetooth delay:':<17}{level} ({LATENCY_LEVELS[level][2]})")
     for unit in ("pirate-bluealsa", "pirate-bluealsa-aplay"):
         res = subprocess.run(["systemctl", "is-active", unit], capture_output=True, text=True)
         print(f"{unit + ':':<23}{res.stdout.strip() or 'unknown'}")
@@ -140,7 +191,13 @@ def main(argv=None):
     f.add_argument("name")
     n = sub.add_parser("name", help="change the name phones see")
     n.add_argument("new_name")
+    lat = sub.add_parser("latency", help="show or change how far the sound lags behind the phone")
+    lat.add_argument("level", nargs="?", choices=list(LATENCY_LEVELS))
     args = parser.parse_args(argv)
+
+    if args.cmd == "latency":  # doesn't need Bluetooth itself
+        cmd_latency(args)
+        return
 
     try:
         bz = Bluez(args.bus)

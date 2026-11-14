@@ -5,7 +5,8 @@ BlueALSA does the audio (A2DP sink -> the Pirate Audio DAC). This module does th
   * sends play/pause/next/previous to the phone
   * pairing: makes the Pi discoverable on request, and acts as the BlueZ pairing agent so the
     6-digit code is shown on the Pirate Audio screen and confirmed with a button
-  * reconnects to the last paired phone at start-up, like a pair of headphones does
+  * reconnects to the paired phone after power-on, like a pair of headphones does: it waits until the
+    Bluetooth adapter is powered and BlueALSA is listening, then keeps trying for a few minutes
 """
 
 import logging
@@ -16,6 +17,7 @@ from gi.repository import Gio, GLib
 log = logging.getLogger(__name__)
 
 BLUEZ = "org.bluez"
+BLUEALSA = "org.bluealsa"  # the Bluetooth audio service; phones connected before it's up get no sound
 IFACE_ADAPTER = "org.bluez.Adapter1"
 IFACE_DEVICE = "org.bluez.Device1"
 IFACE_PLAYER = "org.bluez.MediaPlayer1"
@@ -27,6 +29,9 @@ AGENT_PATH = "/org/pirateaudio/agent"
 CONFIRM_TIMEOUT_S = 30
 OWN_WRITE_GRACE_S = 2.0
 PLAYING_STATES = ("playing", "forward-seek", "reverse-seek")
+RECONNECT_EVERY_S = 10  # a phone that's out of range or asleep is tried again this often
+SETTLE_S = 2.0  # after the adapter appears or powers on, BlueZ needs a moment to list the paired phones
+BLUEALSA_GRACE_S = 15  # if BlueALSA still isn't on the bus after this, try connecting anyway (next round)
 
 AGENT_XML = """
 <node>
@@ -61,17 +66,20 @@ class BluetoothClient:
       Pairing   bool   pairing mode on/off
       Alias     str    the name phones see
       Paired    list   names of paired devices
+      Connecting bool  trying to reconnect to a paired phone right now
+      Ready     bool   start-up is done (the adapter is on and Paired is complete)
 
     and on_agent(kind, device_name, text) for pairing:
       "confirm" (text = 6-digit code), "cancel", "paired", "display" (text = code), "failed".
     """
 
     def __init__(self, on_update, on_agent, bus="system", alias="Pirate Audio",
-                 reconnect_on_start=True, auto_pair_if_none=True, pair_seconds=180):
+                 reconnect_on_start=True, auto_pair_if_none=True, pair_seconds=180, reconnect_seconds=180):
         self._on_update = on_update
         self._on_agent = on_agent
         self.alias = alias
         self.reconnect_on_start = reconnect_on_start
+        self.reconnect_seconds = int(reconnect_seconds)
         self.auto_pair_if_none = auto_pair_if_none
         self.pair_seconds = int(pair_seconds)
 
@@ -85,7 +93,13 @@ class BluetoothClient:
         self._own_writes = []  # [(value, time)] Discoverable writes not yet confirmed by BlueZ
         self._last = {}
         self._subs = []
-        self._synced_once = False
+        self._started = False  # start-up actions (auto-pair or reconnect) done for this BlueZ instance
+        self._startup_source = 0
+        self.reconnect_until = 0.0  # keep trying to reach a paired phone until then
+        self._reconnect_began = 0.0
+        self._reconnect_source = 0
+        self._attempting = False
+        self.bluealsa = False
 
         bus_type = Gio.BusType.SESSION if bus == "session" else Gio.BusType.SYSTEM
         self._conn = Gio.bus_get_sync(bus_type, None)
@@ -93,6 +107,19 @@ class BluetoothClient:
         self._agent_reg = self._conn.register_object(AGENT_PATH, agent_info, self._agent_call, None, None)
         self._watch = Gio.bus_watch_name_on_connection(
             self._conn, BLUEZ, Gio.BusNameWatcherFlags.NONE, self._appeared, self._vanished)
+        self._alsa_watch = Gio.bus_watch_name_on_connection(
+            self._conn, BLUEALSA, Gio.BusNameWatcherFlags.NONE, self._alsa_appeared, self._alsa_vanished)
+
+    def _alsa_appeared(self, conn, name, owner):
+        log.info("BlueALSA is on the bus")
+        self.bluealsa = True
+        if self.reconnect_until and self._reconnect_source:
+            self._reconnect_step()  # don't wait for the next round
+
+    def _alsa_vanished(self, conn, name):
+        if self.bluealsa:
+            log.warning("BlueALSA left the bus")
+        self.bluealsa = False
 
     # == BlueZ appearing / disappearing ==========================================
     def _appeared(self, conn, name, owner):
@@ -117,6 +144,9 @@ class BluetoothClient:
         self.objects = {}
         self.pairing = False
         self._drop_pending(reject=False)
+        self._started = False  # when bluetoothd comes back, reconnect like after power-on
+        self._cancel_startup()
+        self._stop_reconnecting()
         self._emit()
 
     def _got_objects(self, conn, result):
@@ -128,13 +158,37 @@ class BluetoothClient:
         self._register_agent()
         self._setup_adapter()
         self._emit()
-        if not self._synced_once:
-            self._synced_once = True
-            if self.auto_pair_if_none and not self._paired_devices():
-                log.info("No phones paired yet: pairing mode on")
-                self.start_pairing()
-            elif self.reconnect_on_start:
-                self.reconnect()
+        self._schedule_startup(0)  # BlueZ listed everything at once, so no need to wait
+
+    # == after power-on: pair the first phone, or reconnect the paired one ==========
+    def _adapter_powered(self):
+        adapter = self._adapter_path()
+        return bool(adapter and self.objects[adapter].get(IFACE_ADAPTER, {}).get("Powered"))
+
+    def _schedule_startup(self, delay):
+        """Run the start-up actions once the adapter is powered. At boot the Pi's Bluetooth chip often
+        shows up (or powers on) a little after BlueZ starts, so this can't simply run at the first sync."""
+        if self._started or self._startup_source or not self._adapter_powered():
+            return
+        self._startup_source = GLib.timeout_add(int(delay * 1000), self._startup)
+
+    def _cancel_startup(self):
+        if self._startup_source:
+            GLib.source_remove(self._startup_source)
+            self._startup_source = 0
+
+    def _startup(self):
+        self._startup_source = 0
+        if self._started or not self._adapter_powered():
+            return False
+        self._started = True
+        if self.auto_pair_if_none and not self._paired_devices():
+            log.info("No phones paired yet: pairing mode on")
+            self.start_pairing()
+        elif self.reconnect_on_start:
+            self.start_reconnecting(self.reconnect_seconds)
+        self._emit()
+        return False
 
     # == signals ==================================================================
     def _ifaces_added(self, conn, sender, path, iface, member, params, *_):
@@ -142,6 +196,7 @@ class BluetoothClient:
         self.objects.setdefault(obj_path, {}).update(interfaces)
         if IFACE_ADAPTER in interfaces:
             self._setup_adapter()
+            self._schedule_startup(SETTLE_S)
         self._emit()
 
     def _ifaces_removed(self, conn, sender, path, iface, member, params, *_):
@@ -168,6 +223,8 @@ class BluetoothClient:
             self._set(path, IFACE_DEVICE, "Trusted", GLib.Variant("b", True))
             self._on_agent("paired", name, "")
             self.stop_pairing()
+        if changed_iface == IFACE_ADAPTER and changed.get("Powered"):
+            self._schedule_startup(SETTLE_S)
         if (changed_iface == IFACE_ADAPTER and "Discoverable" in changed
                 and not self._is_own_echo(bool(changed["Discoverable"]))):
             if changed["Discoverable"] and not self.pairing:
@@ -234,6 +291,8 @@ class BluetoothClient:
             "Pairing": self.pairing,
             "Alias": aprops.get("Alias", ""),
             "Paired": [self._device_name(p) for p in self._paired_devices()],
+            "Connecting": bool(self.reconnect_until and not device and self._reconnect_targets()),
+            "Ready": self._started,
         }
 
     def _emit(self):
@@ -275,12 +334,12 @@ class BluetoothClient:
         self._conn.call(BLUEZ, path, PROPS, "Set", GLib.Variant("(ssv)", (iface, prop, variant)),
                         None, Gio.DBusCallFlags.NONE, 5000, None, done)
 
-    def _call(self, path, iface, method, args=None, on_ok=None, on_error=None, timeout=10000):
+    def _call(self, path, iface, method, args=None, on_ok=None, on_error=None, timeout=10000, quiet=False):
         def done(conn, result):
             try:
                 conn.call_finish(result)
             except GLib.Error as err:
-                log.info("%s.%s on %s: %s", iface, method, path, err.message)
+                (log.debug if quiet else log.info)("%s.%s on %s: %s", iface, method, path, err.message)
                 if on_error:
                     on_error(err.message)
                 return
@@ -438,7 +497,7 @@ class BluetoothClient:
 
     # == playback commands ===================================================================
     def command(self, action, on_error=None) -> bool:
-        """action: "playpause" | "next" | "previous". Returns False if there's no player."""
+        """action: "playpause" | "play" | "next" | "previous". Returns False if there's no player."""
         player = self._current_player(self.device_path)
         if not player:
             return False
@@ -446,26 +505,87 @@ class BluetoothClient:
             status = self.objects[player][IFACE_PLAYER].get("Status")
             method = "Pause" if status in PLAYING_STATES else "Play"
         else:
-            method = {"next": "Next", "previous": "Previous"}[action]
+            method = {"play": "Play", "next": "Next", "previous": "Previous"}[action]
         self._call(player, IFACE_PLAYER, method, on_error=on_error)
         return True
 
-    def reconnect(self):
-        """Ask paired phones (one at a time) to connect, like headphones do when switched on."""
-        if self._current_device():
+    def _reconnect_targets(self):
+        """Paired, trusted phones that send audio; the one used last in this session first."""
+        devices = []
+        for path in self._paired_devices():
+            dev = self.objects[path][IFACE_DEVICE]
+            uuids = [str(u).lower() for u in dev.get("UUIDs", [])]
+            if dev.get("Trusted") and (not uuids or A2DP_SOURCE_UUID in uuids):
+                devices.append(path)
+        if self.device_path in devices:
+            devices.remove(self.device_path)
+            devices.insert(0, self.device_path)
+        return devices
+
+    def start_reconnecting(self, seconds) -> bool:
+        """Keep asking the paired phone(s) to connect for `seconds`, like headphones that were just
+        switched on. iPhones never connect to an audio accessory by themselves, so this is what makes
+        it "just work" after power-on. Returns False if there's nothing to reconnect to."""
+        if self._current_device() or not self._reconnect_targets():
+            return False
+        now = time.monotonic()
+        if not self.reconnect_until:
+            self._reconnect_began = now
+            log.info("Looking for %s for %d s", self._device_name(self._reconnect_targets()[0]), seconds)
+        self.reconnect_until = max(self.reconnect_until, now + seconds)
+        if not self._reconnect_source:
+            self._reconnect_source = GLib.timeout_add_seconds(RECONNECT_EVERY_S, self._reconnect_timer)
+        self._reconnect_step()
+        self._emit()
+        return True
+
+    def _reconnect_timer(self):
+        if self._reconnect_step():
+            return True
+        self._reconnect_source = 0
+        self._stop_reconnecting()
+        return False
+
+    def _reconnect_step(self) -> bool:
+        """One round of trying. Returns False when there's no point trying any more."""
+        now = time.monotonic()
+        if self._current_device() or now >= self.reconnect_until:
+            return False
+        if not self._adapter_powered() or self.pairing:
+            return True  # wait: the radio is still starting up, or a new phone is being paired
+        if not self.bluealsa and now - self._reconnect_began < BLUEALSA_GRACE_S:
+            return True  # a phone connected before the audio service is up would get no sound
+        if not self._attempting:
+            targets = self._reconnect_targets()
+            if not targets:
+                return False
+            self._attempt(targets)
+        return True
+
+    def _attempt(self, remaining):
+        if not remaining or self._current_device() or not self.reconnect_until:
+            self._attempting = False
             return
-        devices = [p for p in self._paired_devices()
-                   if self.objects[p][IFACE_DEVICE].get("Trusted")]
+        self._attempting = True
+        path = remaining[0]
+        log.debug("Trying to reconnect to %s", self._device_name(path))
 
-        def attempt(remaining):
-            if not remaining or self._current_device():
-                return
-            path = remaining[0]
-            log.info("Trying to reconnect to %s", self._device_name(path))
-            self._call(path, IFACE_DEVICE, "Connect", on_error=lambda _m: attempt(remaining[1:]),
-                       timeout=30000)
+        def connected():
+            self._attempting = False
+            log.info("Reconnected to %s", self._device_name(path))
 
-        attempt(devices)
+        self._call(path, IFACE_DEVICE, "Connect", on_ok=connected,
+                   on_error=lambda _m: self._attempt(remaining[1:]), timeout=30000, quiet=True)
+
+    def _stop_reconnecting(self):
+        if self._reconnect_source:
+            GLib.source_remove(self._reconnect_source)
+            self._reconnect_source = 0
+        if self.reconnect_until:
+            self.reconnect_until = 0.0
+            if not self._current_device():
+                log.info("Stopped looking for the phone")
+            self._emit()
 
     def disconnect(self):
         if self.device_path:
@@ -473,9 +593,14 @@ class BluetoothClient:
 
     def close(self):
         self._drop_pending(reject=True)
-        if self._watch:
-            Gio.bus_unwatch_name(self._watch)
-            self._watch = 0
+        self._cancel_startup()
+        if self._reconnect_source:
+            GLib.source_remove(self._reconnect_source)
+            self._reconnect_source = 0
+        for attr in ("_watch", "_alsa_watch"):
+            if getattr(self, attr):
+                Gio.bus_unwatch_name(getattr(self, attr))
+                setattr(self, attr, 0)
         for sub in self._subs:
             self._conn.signal_unsubscribe(sub)
         self._subs = []

@@ -33,7 +33,7 @@ bash install.sh           # install (it asks first)
 ```
 
 Options: `--name "…"`, `--y-pin 20` for early boards, `--upload-port 8090` if port 6681 is taken,
-`--no-upload` to skip the upload page. Running `install.sh` again updates the add-on and keeps your settings.
+`--no-upload` to skip the upload page, `--latency low` for less audio delay (see below). Running `install.sh` again updates the add-on and keeps your settings.
 
 Everything comes from Raspberry Pi OS packages, so nothing is compiled. The install takes a few minutes.
 
@@ -44,8 +44,9 @@ Everything comes from Raspberry Pi OS packages, so nothing is compiled. The inst
 2. On the iPhone, go to **Settings → Bluetooth** and tap **Pirate Audio**.
 3. Both screens show the same 6-digit code. Press **A** on the Pirate Audio and tap **Pair** on the iPhone.
 
-After that it works like headphones. Pick **Pirate Audio** in Control Center (or the iPhone reconnects by itself),
-plug your headphones into the Pirate Audio, and play.
+After that it works like headphones. When you switch the Pi on, it connects to your iPhone by itself: it keeps
+trying for 3 minutes, so it's fine if the phone is still in your pocket or asleep. You can also pick
+**Pirate Audio** in Control Center at any time. Plug your headphones into the Pirate Audio and play.
 
 ## Add music from your PC or phone
 
@@ -77,8 +78,19 @@ under `[upload]` in `settings.ini`, then run `systemctl --user restart pirate-up
 
 - **Info screen:** **X** pairs a new phone, **A** closes it.
 - **Code screen:** **A** accepts, **B** cancels.
-- **Idle screen:** **A** reconnects your last phone.
+- **Idle screen:** **A** connects your phone and starts its music.
 - **When Bluetooth isn't playing:** the buttons and screen belong to Mopidy, exactly as before.
+
+### Right after you switch it on
+
+The first press of **A** plays whatever you listened to last:
+
+- **Your phone was last:** the Bluetooth screen shows *Connecting…*, then your phone's name. Press **A** and
+  your phone starts playing. Press **X** on that screen to use the Pi's own music (Mopidy) instead. If your
+  phone doesn't turn up within 3 minutes, or you don't press anything for 5 minutes, Mopidy gets the screen.
+- **The Pi's music (Mopidy) was last:** Mopidy's screen comes up with your queue back where it was,
+  paused. Press **A** to carry on. Your phone still connects in the background, so you can start it from the
+  phone whenever you like.
 
 B and Y work like a volume knob on the headphone amp. They're separate from the phone's own volume.
 
@@ -88,9 +100,29 @@ B and Y work like a volume knob on the headphone amp. They're separate from the 
   screen shows your phone's song.
 - **Phone paused for a minute, or disconnected:** "Back to Mopidy…" appears, Mopidy starts again, and its
   queue comes back paused at the same spot, without making a sound.
-- **A phone that just connects (without playing) doesn't interrupt Mopidy.** Your iPhone auto-connecting when
-  you walk in won't stop the music.
+- **A phone that just connects (without playing) doesn't interrupt Mopidy.** Your iPhone connecting
+  after power-on won't stop the music.
+- **Mopidy's queue survives reboots and power cuts.** Normally Mopidy starts empty after a reboot, so its
+  play button did nothing. The add-on writes the queue down while Mopidy runs and puts it back (paused, at
+  the same spot) when Mopidy starts again. Mopidy's own settings aren't changed for this.
 - If the add-on ever crashes while Mopidy is paused out of the way, it restarts Mopidy when it comes back.
+
+## Audio delay (latency)
+
+Bluetooth audio always lags a little behind the phone. The Pi's share of that is the buffer it keeps to
+ride out radio hiccups, and you can choose its size:
+
+```bash
+pirate-bluetooth latency          # show the current setting
+pirate-bluetooth latency low      # about 0.1 s on the Pi: snappiest
+pirate-bluetooth latency normal   # about 0.2 s (the default)
+pirate-bluetooth latency safe     # about 0.5 s: BlueALSA's own default, most robust
+```
+
+A smaller buffer makes play/pause and volume feel quicker and brings videos closer to lip sync. The cost is
+more chance of a crackle or dropout when the radio is busy, for example during a big Wi-Fi transfer (the
+Pi's Wi-Fi and Bluetooth share one chip). If `low` crackles, go back to `normal`. The phone and the Bluetooth
+link add roughly another 0.1-0.2 s that the Pi can't change.
 
 ## Commands
 
@@ -98,6 +130,7 @@ B and Y work like a volume knob on the headphone amp. They're separate from the 
 pirate-bluetooth                     # status: name, pairing mode, paired phones
 pirate-bluetooth pair                # pairing mode for 3 minutes
 pirate-bluetooth name "Kite's Pirate"
+pirate-bluetooth latency low         # less audio delay (low / normal / safe)
 pirate-bluetooth forget "Kite's iPhone"   # or: forget all
 journalctl --user -u pirate-bluetooth -f  # screen/buttons log
 journalctl -u pirate-bluealsa-aplay -f    # Bluetooth audio log
@@ -105,7 +138,9 @@ journalctl --user -u pirate-upload -f     # upload page log
 ```
 
 Settings are in `~/.config/pirate-bluetooth/settings.ini`. They include how long the phone can stay paused
-before Mopidy gets the screen back, the Y-button pin on early boards, screen rotation and the volume step.
+before Mopidy gets the screen back, how long it looks for your phone after power-on (`reconnect_seconds`),
+how long it waits for the first press of A after power-on (`boot_wait`), the Y-button pin on early boards,
+screen rotation and the volume step.
 After editing, run `systemctl --user restart pirate-bluetooth`.
 
 ## Good to know
@@ -115,13 +150,17 @@ After editing, run `systemctl --user restart pirate-bluetooth`.
 - **No album art over Bluetooth:** the screen draws a colored card for each album instead.
 - Bluetooth audio uses a standard Bluetooth codec, so it's slightly lower quality than a wired or AirPlay
   connection, but fine for headphones.
-- The screen program starts with your user services, the same way Mopidy does. The Bluetooth audio itself runs
-  from power-on.
+- Everything starts at power-on, with no login needed. If your user services (Mopidy's included) only
+  started at login before, the installer turns on "linger" for your user, as Pimoroni suggests for Mopidy.
 
 ## Troubleshooting
 
 - **The iPhone doesn't list "Pirate Audio".** It only appears in pairing mode: hold A, then press X, or run
   `pirate-bluetooth pair`.
+- **The phone doesn't connect by itself after power-on.** Check that the phone's Bluetooth is on and that
+  it lists "Pirate Audio" under My Devices. The Pi only looks for 3 minutes after power-on; after that, press
+  **A** or pick it in Control Center. If it never connects by itself, `journalctl --user -u pirate-bluetooth`
+  shows what happened.
 - **Connected, but no sound.** Press Y a few times (headphone volume) and check the phone's volume. Then check
   `systemctl status pirate-bluealsa pirate-bluealsa-aplay`.
 - **Y does nothing.** Boards made before 23 January 2020 use BCM 20. Set `y_pin = 20` in `settings.ini`.
@@ -146,11 +185,13 @@ bash uninstall.sh --purge   # also removes settings.ini and the extra packages i
 | BlueALSA package (Bluetooth audio) | `bluez-alsa-utils`, only if missing | removed |
 | Bluetooth audio services | `pirate-bluealsa`, `pirate-bluealsa-aplay` | removed |
 | "Pirate Headphone" volume control | a marked block in `/etc/asound.conf` (backed up) | removed |
+| Audio delay setting | `/etc/default/pirate-bluetooth-latency` | removed |
 | Shows up as headphones on phones | one line in `/etc/bluetooth/main.conf` (backed up) | original line put back |
 | Screen/buttons/pairing program | `~/.local/share/pirate-bluetooth`, user service `pirate-bluetooth` | removed |
 | `pirate-bluetooth` command | `/usr/local/bin` | removed |
 | Music upload page | user service `pirate-upload` (port 6681) | removed; your uploaded music stays |
-| **Not changed** | Mopidy and its config, default sound output, other sound cards, Wi-Fi, how your services start, already-installed packages | |
+| Start at power-on | `loginctl enable-linger` for your user, only if it was off | turned back off |
+| **Not changed** | Mopidy and its config, default sound output, other sound cards, Wi-Fi, already-installed packages | |
 
 ## Credits
 

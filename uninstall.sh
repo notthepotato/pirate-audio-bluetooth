@@ -32,6 +32,7 @@ success() { echo -e "$(c setaf 2)$1$(c sgr0)"; }
 
 NEW_PACKAGES="" DISABLED_UNITS="" GROUPS_ADDED="" CONFIG_TXT_ADDED=""
 CLASS_CHANGED="" CLASS_ORIG_LINE="" BT_ENABLED_BY_US="" RFKILL_UNBLOCKED="" ASOUND_CREATED=""
+LINGER_ENABLED_BY_US=""
 if [ -f "$RECORD" ]; then
     # shellcheck disable=SC1090
     source "$RECORD"
@@ -52,7 +53,8 @@ fi
 
 inform "Removing the Bluetooth audio services"
 sudo systemctl disable --now pirate-bluealsa-aplay pirate-bluealsa 2>/dev/null || true
-sudo rm -f "$UNIT_DIR/pirate-bluealsa.service" "$UNIT_DIR/pirate-bluealsa-aplay.service"
+sudo rm -f "$UNIT_DIR/pirate-bluealsa.service" "$UNIT_DIR/pirate-bluealsa-aplay.service" \
+    "$ROOT/etc/default/pirate-bluetooth-latency"
 sudo systemctl daemon-reload
 
 REMOVE_PKGS=()
@@ -97,6 +99,11 @@ else
 fi
 if [ "$RFKILL_UNBLOCKED" = "yes" ] && command -v rfkill >/dev/null; then
     sudo rfkill block bluetooth || true
+fi
+
+if [ "$LINGER_ENABLED_BY_US" = "yes" ]; then
+    inform "Your user services start at login again (as before the install)"
+    sudo loginctl disable-linger "$USER" || true
 fi
 
 inform "Removing the program and the pirate-bluetooth command"

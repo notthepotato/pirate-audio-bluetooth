@@ -13,13 +13,15 @@ from gi.repository import GLib
 from . import __version__
 from .bluetooth import BluetoothClient
 from .state import NowPlaying, format_time
-from .system import HeadphoneVolume, MopidyHandoff, local_ip
+from .system import (HeadphoneVolume, MopidyHandoff, boot_id, local_ip, read_json, shutting_down,
+                     uptime, write_json)
 from .view import View
 
 log = logging.getLogger("pirate_bluetooth")
 
 DEFAULTS = {
     "bluetooth": {"name": "Pirate Audio", "pair_seconds": "180", "reconnect_on_start": "yes",
+                  "reconnect_seconds": "180", "boot_wait": "300",
                   "auto_pair_if_none": "yes", "handback_after": "60", "bus": "system"},
     "display": {"rotation": "90", "spi_mhz": "80", "sleep_after": "120"},
     "buttons": {"y_pin": "24", "hold_time": "0.7"},
@@ -31,6 +33,10 @@ DEFAULTS = {
 STATE_DIR = os.path.join(os.path.expanduser("~"), ".local", "state", "pirate-bluetooth")
 TICK_MS = 500
 HW_RETRIES = 20
+MOPIDY_WATCH_S = 5  # how often Mopidy's queue/state is looked at while it has the screen
+FRESH_BOOT_S = 600  # started this soon after power-on (and first time this boot) = "just switched on"
+PRESS_RECONNECT_S = 30  # A pressed with no phone connected: keep trying this long
+PLAY_WAIT_S = 12  # ...and send Play if the phone shows up within this long after it connects
 
 
 def load_config(path):
@@ -61,6 +67,15 @@ class App:
         self.confirm = None  # {"phone": str, "code": str}
         self.last_playing_at = 0.0
         self.hold_until = 0.0  # keep the screen a while after pairing, so the new phone can start playing
+        self.connecting = False  # looking for a paired phone right now
+        self.bt_ready = False  # BlueZ has finished starting up (so self.paired is complete)
+        self.play_pending_until = 0.0  # A was pressed before the phone was there: play when it is
+        # After power-on, if the phone was what played last, the Bluetooth screen keeps the buttons for
+        # a while (instead of Mopidy), so that A plays the phone. Ended by boot_wait, X, or events below.
+        self.boot_hold_until = 0.0
+        self.boot_saw_connecting = False
+        self.boot_saw_phone = False
+        self._stop = threading.Event()
 
         self.overlay = None
         self.overlay_until = 0.0
@@ -87,9 +102,18 @@ class App:
         )
         self.mopidy = MopidyHandoff(mode=args.mopidy or cfg.get("mopidy", "handoff"),
                                     rpc_url=cfg.get("mopidy", "rpc_url"),
-                                    state_file=os.path.join(STATE_DIR, "mopidy-handoff.json"))
+                                    state_file=os.path.join(STATE_DIR, "mopidy-handoff.json"),
+                                    queue_file=os.path.join(STATE_DIR, "mopidy-queue.json"))
         if self.mopidy.recover():
             self.mopidy.give_back()  # a previous run stopped Mopidy and didn't get to restart it
+
+        self._last_used_file = os.path.join(STATE_DIR, "last-used.json")
+        self.last_used = (read_json(self._last_used_file) or {}).get("source")
+        if (self._just_switched_on() and self.mopidy.enabled
+                and cfg.getboolean("bluetooth", "reconnect_on_start")
+                and self.last_used in ("phone", None)):  # None: nothing recorded yet (first run)
+            log.info("Switched on, and the phone played last: the Bluetooth screen has the buttons for now")
+            self.boot_hold_until = time.monotonic() + cfg.getfloat("bluetooth", "boot_wait")
 
         if args.record:
             self.renderer = RecordRenderer()
@@ -104,16 +128,85 @@ class App:
             reconnect_on_start=cfg.getboolean("bluetooth", "reconnect_on_start"),
             auto_pair_if_none=cfg.getboolean("bluetooth", "auto_pair_if_none"),
             pair_seconds=cfg.getint("bluetooth", "pair_seconds"),
+            reconnect_seconds=cfg.getint("bluetooth", "reconnect_seconds"),
         )
         threading.Thread(target=self.volume.ensure_control, daemon=True).start()
+        if self.mopidy.enabled:
+            threading.Thread(target=self._watch_mopidy, daemon=True).start()
         GLib.timeout_add(TICK_MS, self._tick)
         self._update_ownership()
+
+    # == what was used last, across reboots ========================================
+    def _just_switched_on(self) -> bool:
+        """First start since the Pi booted, and soon after it (not a restart of this program)."""
+        marker = os.path.join(STATE_DIR, "boot-id")
+        current = boot_id()
+        try:
+            with open(marker, encoding="utf-8") as fh:
+                seen = fh.read().strip()
+        except OSError:
+            seen = None
+        if seen == current:
+            return False
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            with open(marker, "w", encoding="utf-8") as fh:
+                fh.write(current)
+        except OSError:
+            pass
+        return uptime() < FRESH_BOOT_S
+
+    def set_last_used(self, source):
+        if source != self.last_used:
+            log.info("Last used: %s", "phone" if source == "phone" else "the Pi's music (Mopidy)")
+            self.last_used = source
+            write_json(self._last_used_file, {"source": source})
+        return False
+
+    def _watch_mopidy(self):
+        """Worker thread: keeps Mopidy's saved queue current (and puts it back after power-on), and
+        notices when Mopidy is what's playing."""
+        while not self._stop.wait(MOPIDY_WATCH_S):
+            try:
+                if self.mopidy.watch_step() == "playing":
+                    GLib.idle_add(self.set_last_used, "mopidy")
+            except Exception:
+                log.exception("Watching Mopidy failed")
+
+    # == right after power-on ===========================================================
+    def boot_hold_active(self) -> bool:
+        if not self.boot_hold_until:
+            return False
+        reason = None
+        if time.monotonic() >= self.boot_hold_until:
+            reason = ""
+        elif self.bt_ready and not self.paired:
+            reason = ""
+        elif self.phone and self.np.playing:
+            reason = ""  # the phone is playing: the usual rules take over from here
+        elif self.boot_saw_phone and not self.phone:
+            reason = ""  # it connected and went away again
+        elif self.boot_saw_connecting and not self.connecting and not self.phone:
+            reason = f"Couldn't find {self.paired[0]}" if self.paired else ""
+        if reason is not None:
+            self.end_boot_hold(reason)
+            return False
+        return True
+
+    def end_boot_hold(self, message=""):
+        if self.boot_hold_until:
+            log.info("Power-on wait for the phone is over%s", f": {message}" if message else "")
+            self.boot_hold_until = 0.0
+            if message:
+                self.toast(message)
 
     # == who owns the screen and buttons: us or Mopidy =============================
     def wants_hardware(self) -> bool:
         if not self.mopidy.enabled:
             return True  # no Mopidy to share with: always ours
         if self.pairing or self.confirm or time.monotonic() < self.hold_until:
+            return True
+        if self.boot_hold_active():
             return True
         if self.phone and self.np.playing:
             return True
@@ -190,7 +283,7 @@ class App:
         self._render()
         return False
 
-    def release(self):
+    def release(self, handback_screen=True):
         if self._acquire_source:
             GLib.source_remove(self._acquire_source)
             self._acquire_source = 0
@@ -199,7 +292,7 @@ class App:
         if self.buttons:
             self.buttons.close()
         if self.display:
-            if self.mopidy.enabled:
+            if self.mopidy.enabled and handback_screen:
                 # Mopidy takes a few seconds to start; don't leave the old song frozen on screen.
                 try:
                     if self.asleep:
@@ -212,6 +305,7 @@ class App:
         self.display = self.buttons = None
         self.hw_owned = False
         self.info_until = 0.0
+        self.play_pending_until = 0.0  # A pressed on our screen doesn't carry over to Mopidy's
         log.info("Display and buttons handed back")
 
     # == Bluetooth events =============================================================
@@ -224,6 +318,8 @@ class App:
             if phone and phone != self.phone:
                 log.info("%s connected", phone)
                 self.wake()
+                if self.boot_hold_until:
+                    self.boot_saw_phone = True
             elif not phone and self.phone:
                 log.info("%s disconnected", self.phone)
                 self.np.clear()
@@ -242,6 +338,14 @@ class App:
             self.np.apply_position(changes["Position"], now)
         if self.np.playing:
             self.last_playing_at = now
+            self.play_pending_until = 0.0
+            self.set_last_used("phone")
+        if "Connecting" in changes:
+            self.connecting = bool(changes["Connecting"])
+            if self.connecting and self.boot_hold_until:
+                self.boot_saw_connecting = True
+        if changes.get("Ready"):
+            self.bt_ready = True
         if "Pairing" in changes:
             self.pairing = bool(changes["Pairing"])
             if self.pairing:
@@ -252,6 +356,10 @@ class App:
             self.alias = changes["Alias"] or ""
         if "Paired" in changes:
             self.paired = list(changes["Paired"] or [])
+        if self.play_pending_until and self.phone and self.has_player:
+            # A was pressed while the phone was still connecting: now it can be told to play.
+            self.play_pending_until = 0.0
+            self.bt.command("play", on_error=lambda _m: self.toast("Your phone didn't respond"))
         self._update_ownership()
         self.request_render()
 
@@ -311,6 +419,8 @@ class App:
             self.play_pause()
         elif name == "A" and kind == "long":
             self.info_until = time.monotonic() + 10.0
+        elif name == "X" and kind == "short" and self.boot_hold_until and not self.np.playing:
+            self.end_boot_hold("Switching to the Pi's music…")
         elif name == "X" and kind in ("short", "long"):
             self.skip("next" if kind == "short" else "previous")
         elif name in ("B", "Y") and kind in ("press", "repeat"):
@@ -320,13 +430,20 @@ class App:
         return False
 
     def play_pause(self):
+        now = time.monotonic()
         if self.phone and self.has_player:
             self.bt.command("playpause", on_error=lambda _m: self.toast("Your phone didn't respond"))
-        elif self.phone:
-            self.toast("Start the music on your phone")
+        elif self.phone:  # connected a moment ago; its media controls show up a second or two later
+            self.play_pending_until = now + PLAY_WAIT_S
+            self.toast(f"Starting {self.phone}…")
         elif self.paired:
-            self.toast(f"Connecting to {self.paired[0]}…")
-            self.bt.reconnect()
+            if self.bt.start_reconnecting(PRESS_RECONNECT_S):
+                self.play_pending_until = now + PRESS_RECONNECT_S + PLAY_WAIT_S
+                self.toast(f"Connecting to {self.paired[0]}…")
+            elif not self.present:
+                self.toast("Bluetooth is off")
+            else:
+                self.toast("Pick it in your phone's Bluetooth list")
         else:
             self.toast("No phone paired yet: hold A, then press X")
 
@@ -371,12 +488,19 @@ class App:
         if self.info_until and now >= self.info_until:
             self.info_until = 0.0
             dirty = True
+        if self.play_pending_until and now >= self.play_pending_until:
+            self.play_pending_until = 0.0
+            if self.phone:
+                self.toast("Start the music on your phone")
+            elif self.paired:
+                self.toast(f"Couldn't reach {self.paired[0]}. Is its Bluetooth on?")
         if self.np.playing:
             self.last_playing_at = now
             dirty = dirty or self.np.progress is not None
         if self.pairing:
             dirty = True  # countdown
-        busy = self.np.playing or self.pairing or self.confirm
+        # Stay lit while waiting for the first press after power-on: a press on a dark screen only wakes it.
+        busy = self.np.playing or self.pairing or self.confirm or self.boot_hold_until
         if (self.hw_owned and not self.asleep and self.sleep_after > 0 and not busy
                 and now - self.last_activity > self.sleep_after):
             log.info("Screen off (idle)")
@@ -400,6 +524,8 @@ class App:
             phone=self.phone,
             last_phone=self.paired[0] if self.paired else "",
             overlay=self.overlay if (self.overlay and now < self.overlay_until) else None,
+            connecting=self.connecting and not self.phone,
+            choice=bool(self.boot_hold_until) and bool(self.mopidy.enabled),
         )
         if self.confirm:
             view.kind = "confirm"
@@ -410,7 +536,8 @@ class App:
             view.kind = "info"
             view.info = [
                 ("Bluetooth name", view.name),
-                ("Connected", self.phone or ("nothing" if self.present else "Bluetooth is off")),
+                ("Connected", self.phone or ("looking for " + self.paired[0] if self.connecting and self.paired
+                                             else "nothing" if self.present else "Bluetooth is off")),
                 ("Paired phones", ", ".join(self.paired) if self.paired else "none yet"),
                 ("Headphone volume", f"{vol}%" if vol is not None else "not ready"),
                 (("Add music at", f"{local_ip()}:{self.cfg.getint('upload', 'port')}")
@@ -449,10 +576,19 @@ class App:
     # == shutdown ==================================================================================
     def quit(self, *_):
         log.info("Shutting down")
+        self._stop.set()
         self.bt.close()
-        self.release()
-        self.mopidy.give_back()
-        self.mopidy.wait_restore(timeout=60)  # don't cut Mopidy's queue restore short
+        stopping = shutting_down()
+        if not self.mopidy.stopped_by_us:
+            self.mopidy.save_now()  # so the queue is back after the next power-on
+        self.release(handback_screen=not stopping)
+        if stopping:
+            # Powering off or rebooting: don't start Mopidy now. It starts by itself at the next boot,
+            # and its queue is put back then.
+            log.info("The Pi is shutting down; Mopidy's queue is saved for next time")
+        else:
+            self.mopidy.give_back()
+            self.mopidy.wait_restore(timeout=60)  # don't cut Mopidy's queue restore short
         self.loop.quit()
         return False
 

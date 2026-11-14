@@ -1,6 +1,8 @@
 [Unit]
 Description=Pirate Audio Bluetooth screen, buttons and pairing
 Documentation=file://%h/.local/share/pirate-bluetooth/README.md
+# Start after Mopidy (if it's there) and so stop before it: at power-off Mopidy's queue can still be read
+After=mopidy.service
 
 [Service]
 Type=simple
