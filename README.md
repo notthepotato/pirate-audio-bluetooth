@@ -230,8 +230,8 @@ link add roughly another 0.1-0.2 s that the Pi can't change.
 ```bash
 pirate-bluetooth                     # status: name, pairing mode, paired phones, where album art comes from
 pirate-bluetooth pair                # pairing mode for 3 minutes
-pirate-bluetooth name "Kite's Pirate"
-pirate-bluetooth forget "Kite's iPhone"   # or: forget all
+pirate-bluetooth name "Potato's Pirate"
+pirate-bluetooth forget "Potato's iPhone"   # or: forget all
 pirate-bluetooth library             # is Mopidy's music library (Mopidy-Local) on?  "library on" fixes it
 pirate-bluetooth latency low         # less audio delay (low / normal / safe)
 pirate-bluetooth logs                # recent log lines; "logs -f" keeps watching
