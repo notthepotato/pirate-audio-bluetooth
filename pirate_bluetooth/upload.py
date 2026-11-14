@@ -225,8 +225,8 @@ class MusicStore:
 
 
 # ==== refreshing Mopidy's library ===================================================================
-def mopidy_scan_command():
-    """Build 'mopidy --config <same files as the service> local scan' from the Mopidy user service."""
+def _mopidy_execstart():
+    """The Mopidy user service's command line, e.g. ['/home/pi/.virtualenvs/mopidy/bin/mopidy', '--config', 'a:b']."""
     try:
         res = subprocess.run(["systemctl", "--user", "cat", "mopidy"], capture_output=True, text=True,
                              timeout=10)
@@ -236,19 +236,56 @@ def mopidy_scan_command():
         line = line.strip()
         if line.startswith("ExecStart=") and line != "ExecStart=":
             argv = shlex.split(line[len("ExecStart="):])
-            if not argv:
-                continue
-            argv[0] = argv[0].lstrip("-@:+!")
-            return ["nice", "-n", "10", *argv, "local", "scan"]
+            if argv:
+                argv[0] = argv[0].lstrip("-@:+!")
+                return argv
     return None
+
+
+def mopidy_scan_command(argv=None):
+    """Build 'mopidy --config <same files as the service> local scan' from the Mopidy user service."""
+    argv = argv or _mopidy_execstart()
+    return ["nice", "-n", "10", *argv, "local", "scan"] if argv else None
+
+
+def mopidy_config_files(argv=None):
+    """Mopidy's config files in the order the service loads them (later ones win)."""
+    argv = argv or _mopidy_execstart() or []
+    files = []
+    for i, arg in enumerate(argv):
+        if arg == "--config" and i + 1 < len(argv):
+            files += argv[i + 1].split(":")
+        elif arg.startswith("--config="):
+            files += arg.split("=", 1)[1].split(":")
+    return [os.path.expanduser(f) for f in files if f] or [os.path.expanduser("~/.config/mopidy/mopidy.conf")]
+
+
+def mopidy_library_enabled(files):
+    """Is Mopidy-Local (Mopidy's music library) switched on in Mopidy's settings? None if unreadable.
+
+    Pimoroni's installer saves Mopidy's settings as they were at install time into defaults.conf. If
+    Mopidy-Local wasn't working at that exact moment, that file says "[local] enabled = false" for good."""
+    cfg = configparser.RawConfigParser(inline_comment_prefixes=(";",), strict=False)
+    try:
+        cfg.read(files, encoding="utf-8")
+    except (configparser.Error, UnicodeDecodeError):
+        return None
+    value = cfg.get("local", "enabled", fallback="true").strip().lower()
+    return value not in ("false", "no", "off", "0")
+
+
+LIBRARY_OFF = ("Mopidy's music library (Mopidy-Local) is switched off in Mopidy's settings, so new songs only "
+               "show in Iris under Browse → Files. To switch it on, run this on the Pi: pirate-bluetooth library on")
 
 
 class LibraryScanner:
     """Runs Mopidy-Local's scan a few seconds after the last upload (one scan per batch, not per file)."""
 
-    def __init__(self, command, delay):
+    def __init__(self, command, delay, config_files=None):
         self.command = command
         self.delay = delay
+        self.config_files = config_files
+        self._off_from_config = False
         self.state = "idle" if command else "unavailable"
         self.message = "" if command else "Mopidy wasn't found, so its library isn't refreshed automatically."
         self.finished_at = 0
@@ -257,8 +294,15 @@ class LibraryScanner:
         self._again = False
         self._lock = threading.Lock()
 
+    def library_off(self) -> bool:
+        return bool(self.config_files) and mopidy_library_enabled(self.config_files) is False
+
     def request(self, delay=None):
         if not self.command:
+            return
+        if self.library_off():
+            with self._lock:
+                self.state, self.message, self._off_from_config = "off", LIBRARY_OFF, True
             return
         with self._lock:
             if self._running:
@@ -279,17 +323,32 @@ class LibraryScanner:
             self.state = "running"
             self.message = "Adding new music to Mopidy's library…"
         log.info("Running %s", " ".join(self.command))
+        state = "done"
         try:
             res = subprocess.run(self.command, capture_output=True, text=True, timeout=3600)
-            ok = res.returncode == 0
-            tail = (res.stderr or res.stdout).strip().splitlines()[-1:] or [""]
-            message = "Mopidy's library is up to date." if ok else f"Library refresh failed: {tail[0]}"
+            output = f"{res.stdout}\n{res.stderr}"
+            unreadable = [(urllib.parse.unquote(uri.rsplit("/", 1)[-1]), why.strip())
+                          for uri, why in re.findall(r"Failed scanning (file://\S+?):? (.+)", output)]
+            for name, why in unreadable:
+                log.warning("Mopidy couldn't read %s: %s", name, why)
+            if "disabled extension local" in output:  # switched off by Mopidy itself, not in the files
+                state, message = "off", LIBRARY_OFF
+                self._off_from_config = False
+            elif res.returncode != 0:
+                tail = output.strip().splitlines()[-1:] or [""]
+                state, message = "failed", f"Library refresh failed: {tail[0].strip()}"
+            elif unreadable:
+                shown = ", ".join(f"{name} ({why})" for name, why in unreadable[:3])
+                more = f" and {len(unreadable) - 3} more" if len(unreadable) > 3 else ""
+                message = f"Mopidy's library is up to date, but Mopidy couldn't read: {shown}{more}."
+            else:
+                message = "Mopidy's library is up to date."
         except (OSError, subprocess.TimeoutExpired) as err:
-            ok, message = False, f"Library refresh failed: {err}"
-        (log.info if ok else log.warning)(message)
+            state, message = "failed", f"Library refresh failed: {err}"
+        (log.info if state == "done" else log.warning)(message)
         with self._lock:
             self._running = False
-            self.state = "done" if ok else "failed"
+            self.state = state
             self.message = message
             self.finished_at = int(time.time())
             again = self._again
@@ -297,7 +356,13 @@ class LibraryScanner:
             self.request()
 
     def status(self):
-        return {"state": self.state, "message": self.message, "finished_at": self.finished_at}
+        with self._lock:
+            state, message = self.state, self.message
+        if state not in ("waiting", "running") and self.command and self.library_off():
+            state, message = "off", LIBRARY_OFF
+        elif state == "off" and self._off_from_config and not self.library_off():
+            state, message = "idle", ""  # switched back on in Mopidy's settings since
+        return {"state": state, "message": message, "finished_at": self.finished_at}
 
 
 # ==== HTTP ============================================================================================
@@ -468,8 +533,9 @@ def main(argv=None):
         log.info("The upload page is turned off in settings.ini ([upload] enabled = no)")
         return
     command = up.get("scan_command").strip()
+    mopidy_argv = _mopidy_execstart()
     if command == "auto":
-        scan_cmd = mopidy_scan_command()
+        scan_cmd = mopidy_scan_command(mopidy_argv)
     elif command in ("", "none", "off"):
         scan_cmd = None
     else:
@@ -477,7 +543,8 @@ def main(argv=None):
 
     Handler.store = MusicStore(up.get("music_dir"), up.getint("max_file_mb") * 2**20,
                                up.getint("keep_free_mb") * 2**20)
-    Handler.scanner = LibraryScanner(scan_cmd, up.getfloat("scan_delay"))
+    Handler.scanner = LibraryScanner(scan_cmd, up.getfloat("scan_delay"),
+                                     mopidy_config_files(mopidy_argv) if mopidy_argv else None)
     Handler.password = up.get("password").strip()
     Handler.iris_port = mopidy_http_port()
     port = args.port or up.getint("port")
@@ -488,6 +555,8 @@ def main(argv=None):
              " (password protected)" if Handler.password else "")
     if not scan_cmd:
         log.info("Mopidy library refresh: off (%s)", Handler.scanner.message or "disabled in settings")
+    elif Handler.scanner.library_off():
+        log.warning(LIBRARY_OFF)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

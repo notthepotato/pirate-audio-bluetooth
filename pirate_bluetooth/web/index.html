@@ -70,7 +70,7 @@
   #library { display: flex; align-items: center; gap: 10px; font-size: 14px; }
   .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--faint); flex: none; }
   .dot.busy { background: var(--warn); animation: pulse 1s infinite alternate; }
-  .dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); }
+  .dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); } .dot.warn { background: var(--warn); }
   @keyframes pulse { to { opacity: .35; } }
   #recent { list-style: none; margin: 8px 0 0; padding: 0; columns: 2 260px; column-gap: 24px; }
   #recent li { font-size: 13.5px; padding: 3px 0; break-inside: avoid; overflow: hidden;
@@ -161,15 +161,15 @@ async function refreshStatus() {
   $("free").textContent = fmtBytes(Math.max(0, info.free - info.keep_free)) + " free";
   $("iris").href = `${location.protocol}//${location.hostname}:${info.iris_port}/iris/`;
   $("count").textContent = info.count.toLocaleString() + (info.count === 1 ? " song" : " songs");
-  $("where").textContent = `Songs are saved in ${info.music_dir} on the Pi. In Mopidy, find them under Browse → Local media (or Files).`;
   const s = info.scan, dot = $("scanDot");
-  dot.className = "dot" + ({ waiting: " busy", running: " busy", done: " ok", failed: " bad" }[s.state] || "");
+  $("where").textContent = `Songs are saved in ${info.music_dir} on the Pi. In Iris, find them under ` +
+    (s.state === "off" ? "Browse → Files." : "Browse → Local media (or Files).");
+  dot.className = "dot" + ({ waiting: " busy", running: " busy", done: " ok", failed: " bad", off: " warn" }[s.state] || "");
   $("scanText").textContent = {
     idle: "Mopidy's library refreshes by itself after you add music.",
     waiting: "New music will be added to Mopidy's library in a moment…",
     running: "Adding new music to Mopidy's library…",
-    done: "Mopidy's library is up to date.",
-  }[s.state] || s.message || "";
+  }[s.state] || s.message || "Mopidy's library is up to date.";
   const list = $("recent"); list.replaceChildren();
   for (const r of info.recent) {
     const parts = r.path.split("/"), li = el("li");

@@ -8,11 +8,15 @@ import argparse
 import configparser
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
 
 from gi.repository import Gio, GLib
+
+from .system import MopidyHandoff
+from .upload import _mopidy_execstart, mopidy_config_files, mopidy_library_enabled
 
 BLUEZ = "org.bluez"
 ADAPTER = "org.bluez.Adapter1"
@@ -106,6 +110,109 @@ def cmd_latency(args):
         print("If you hear crackles or dropouts, go back with:  pirate-bluetooth latency normal")
 
 
+# == logs ==================================================================================
+# Raspberry Pi OS keeps its journal in memory, where "journalctl --user -u ..." finds nothing; the user
+# services' lines are in the system journal instead, under _SYSTEMD_USER_UNIT.
+LOG_PARTS = {
+    "screen": [("_SYSTEMD_USER_UNIT", "pirate-bluetooth.service")],
+    "upload": [("_SYSTEMD_USER_UNIT", "pirate-upload.service")],
+    "audio": [("_SYSTEMD_UNIT", "pirate-bluealsa.service"), ("_SYSTEMD_UNIT", "pirate-bluealsa-aplay.service")],
+    "mopidy": [("_SYSTEMD_USER_UNIT", "mopidy.service")],
+}
+
+
+def cmd_logs(args):
+    parts = [args.part] if args.part else ["screen", "upload", "audio"]
+    matches = []
+    for part in parts:
+        for field, unit in LOG_PARTS[part]:
+            matches += (["+"] if matches else []) + [f"{field}={unit}"]
+    cmd = ["journalctl", "--no-pager", *(["-f"] if args.follow else ["-n", str(args.lines)]), *matches]
+    if os.geteuid() != 0:
+        cmd.insert(0, "sudo")  # reading the system journal needs it unless you're in the adm group
+    os.execvp(cmd[0], cmd)
+
+
+# == Mopidy's music library (Mopidy-Local) ===================================================
+def switch_on_local(path):
+    """Put 'enabled = true' in the [local] section of one Mopidy config file (backed up first)."""
+    backup = path + ".before-library-on"
+    if os.path.exists(path) and not os.path.exists(backup):
+        shutil.copy2(path, backup)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().split("\n")
+    except FileNotFoundError:
+        lines = []
+    out, section, added = [], None, False
+    for line in lines:
+        m = re.match(r"\s*\[([^\]]+)\]", line)
+        if m:
+            section = m.group(1).strip()
+            out.append(line)
+            if section == "local" and not added:
+                out.append("enabled = true")
+                added = True
+            continue
+        if section == "local" and re.match(r"\s*enabled\s*=", line):
+            continue  # an old enabled = ... line in the same section
+        out.append(line)
+    if not added:  # a second [local] section would stop Mopidy from starting, so only add one if none
+        out += ["", "[local]", "enabled = true", ""]
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(out))
+    return backup
+
+
+def cmd_library(args):
+    argv = _mopidy_execstart()
+    if not argv:
+        sys.exit("Mopidy isn't set up as a user service on this Pi.")
+    files = mopidy_config_files(argv)
+    state = mopidy_library_enabled(files)
+    if not args.action:
+        print(f"Mopidy's music library (Mopidy-Local): {({True: 'on', False: 'off'}).get(state, 'unknown')}")
+        if state is False:
+            print("Songs only show in Iris under Browse > Files. Switch the library on with:  pirate-bluetooth library on")
+        return
+
+    if state:
+        print("Mopidy-Local is already switched on in Mopidy's settings.")
+    else:
+        target = files[-1]  # Mopidy reads its files in order, so the last one has the final say
+        backup = switch_on_local(target)
+        print(f"Switched Mopidy-Local on in {target} (your old file: {backup})")
+
+    running = subprocess.run(["systemctl", "--user", "is-active", "mopidy"], capture_output=True,
+                             text=True).stdout.strip() == "active"
+    if running:
+        cfg = configparser.ConfigParser()
+        cfg.read(SETTINGS)
+        mopidy = MopidyHandoff(mode="on", rpc_url=cfg.get("mopidy", "rpc_url",
+                                                         fallback="http://127.0.0.1:6680/mopidy/rpc"))
+        snap = mopidy.snapshot(quiet=True)  # a restart empties Mopidy's queue; put it back afterwards
+        print("Restarting Mopidy…")
+        subprocess.run(["systemctl", "--user", "restart", "mopidy"])
+        mopidy.restore(snap)
+    else:
+        print("Mopidy isn't running right now (Bluetooth may have it paused); the change applies when it starts.")
+
+    print("Adding your music to the library (big collections take a while)…")
+    res = subprocess.run(["nice", "-n", "10", *argv, "local", "scan"], capture_output=True, text=True)
+    output = f"{res.stdout}\n{res.stderr}"
+    if "disabled extension local" in output:
+        reasons = [l.strip() for l in output.splitlines() if "Disabled extension local" in l
+                   or "configuration errors" in l or l.strip().startswith("local/")]
+        print("Mopidy still keeps Mopidy-Local switched off" + (": " + " ".join(reasons) if reasons else
+              ". Run 'pirate-bluetooth logs mopidy' to see why."))
+        sys.exit(1)
+    for line in output.splitlines():
+        if any(word in line for word in ("Failed scanning", "Done scanning", "Scanned", "Found")):
+            print("  " + line.strip())
+    print("Done. In Iris, your songs are under Browse > Local media (WAVs without tags are listed by file name)."
+          if res.returncode == 0 else f"The library scan didn't finish (exit code {res.returncode}).")
+
+
 def name_of(dev):
     return dev.get("Alias") or dev.get("Name") or dev.get("Address", "?")
 
@@ -193,10 +300,17 @@ def main(argv=None):
     n.add_argument("new_name")
     lat = sub.add_parser("latency", help="show or change how far the sound lags behind the phone")
     lat.add_argument("level", nargs="?", choices=list(LATENCY_LEVELS))
+    lg = sub.add_parser("logs", help="show the add-on's log (screen, upload page, Bluetooth audio)")
+    lg.add_argument("part", nargs="?", choices=list(LOG_PARTS))
+    lg.add_argument("-f", "--follow", action="store_true", help="keep showing new lines")
+    lg.add_argument("-n", "--lines", type=int, default=60)
+    lib = sub.add_parser("library", help="show or switch on Mopidy's music library (Mopidy-Local)")
+    lib.add_argument("action", nargs="?", choices=["on"])
     args = parser.parse_args(argv)
 
-    if args.cmd == "latency":  # doesn't need Bluetooth itself
-        cmd_latency(args)
+    # These don't need Bluetooth itself
+    if args.cmd in ("latency", "logs", "library"):
+        {"latency": cmd_latency, "logs": cmd_logs, "library": cmd_library}[args.cmd](args)
         return
 
     try:

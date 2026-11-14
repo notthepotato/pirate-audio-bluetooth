@@ -60,9 +60,12 @@ Open **`http://raspberrypi.local:6681`** in a browser on the same Wi-Fi. Use you
 - **On an iPhone:** tap *Choose files* and pick songs from the Files app.
 - **Songs already on the Pi** are recognised and not sent again, so you can re-drop a whole folder after adding
   a few songs to it.
+- **Formats:** MP3, M4A/AAC, FLAC, WAV, AIFF, OGG, Opus and more. WAV files usually carry no artist or album
+  info, so Mopidy lists them by file name (under *Tracks* and *Files*) rather than under an album.
 - **Copy-protected Apple Music/iTunes files (`.m4p`) and non-music files** are skipped, and the page says why.
 - **When the uploads finish,** Mopidy's library refreshes by itself in the background, with no restart and no
-  interruption. The songs show up in Iris under *Browse → Local media* (or *Files*).
+  interruption. The songs show up in Iris under *Browse → Local media* (or *Files*). If Mopidy couldn't read a
+  song, or its library is switched off, the page says so.
 
 The page only works on your local network. If you use the Pi on shared Wi-Fi (campus, café…), set a password
 under `[upload]` in `settings.ini`, then run `systemctl --user restart pirate-upload`.
@@ -132,9 +135,9 @@ pirate-bluetooth pair                # pairing mode for 3 minutes
 pirate-bluetooth name "Kite's Pirate"
 pirate-bluetooth latency low         # less audio delay (low / normal / safe)
 pirate-bluetooth forget "Kite's iPhone"   # or: forget all
-journalctl --user -u pirate-bluetooth -f  # screen/buttons log
-journalctl -u pirate-bluealsa-aplay -f    # Bluetooth audio log
-journalctl --user -u pirate-upload -f     # upload page log
+pirate-bluetooth library             # is Mopidy's music library (Mopidy-Local) on?  "library on" fixes it
+pirate-bluetooth logs                # recent log lines; "logs -f" keeps watching
+pirate-bluetooth logs upload         # just one part: screen, upload, audio or mopidy
 ```
 
 Settings are in `~/.config/pirate-bluetooth/settings.ini`. They include how long the phone can stay paused
@@ -159,7 +162,7 @@ After editing, run `systemctl --user restart pirate-bluetooth`.
   `pirate-bluetooth pair`.
 - **The phone doesn't connect by itself after power-on.** Check that the phone's Bluetooth is on and that
   it lists "Pirate Audio" under My Devices. The Pi only looks for 3 minutes after power-on; after that, press
-  **A** or pick it in Control Center. If it never connects by itself, `journalctl --user -u pirate-bluetooth`
+  **A** or pick it in Control Center. If it never connects by itself, `pirate-bluetooth logs screen`
   shows what happened.
 - **Connected, but no sound.** Press Y a few times (headphone volume) and check the phone's volume. Then check
   `systemctl status pirate-bluealsa pirate-bluealsa-aplay`.
@@ -168,8 +171,13 @@ After editing, run `systemctl --user restart pirate-bluetooth`.
 - **The upload page doesn't open.** Check that your PC or phone is on the same Wi-Fi as the Pi, and try the IP
   address from the info screen instead of `raspberrypi.local`. Then check `systemctl --user status pirate-upload`.
   Some campus and public networks block devices from reaching each other.
-- **Uploaded songs don't show in Mopidy's Local media.** Look under *Files* (that always works). If Local media
-  stays empty, Mopidy-Local's scan may have failed: `journalctl --user -u pirate-upload` shows why.
+- **Uploaded songs don't show in Mopidy's Local media (or Iris's Artists/Albums/Tracks).** They're always
+  under *Browse → Files*. If Local media is missing or stays empty, run `pirate-bluetooth library`. Pimoroni's
+  installer saves Mopidy's settings as they were at install time, and if Mopidy-Local had a hiccup at that
+  moment, it stays switched off from then on. `pirate-bluetooth library on` switches it back on: it adds one
+  line to `~/.config/mopidy/mopidy.conf` (keeping a copy of the old file), restarts Mopidy with its queue
+  put back, and adds your music to the library. `pirate-bluetooth logs upload` shows any songs Mopidy couldn't
+  read.
 
 ## Uninstall
 
@@ -191,7 +199,8 @@ bash uninstall.sh --purge   # also removes settings.ini and the extra packages i
 | `pirate-bluetooth` command | `/usr/local/bin` | removed |
 | Music upload page | user service `pirate-upload` (port 6681) | removed; your uploaded music stays |
 | Start at power-on | `loginctl enable-linger` for your user, only if it was off | turned back off |
-| **Not changed** | Mopidy and its config, default sound output, other sound cards, Wi-Fi, already-installed packages | |
+| Mopidy's music library | only if you run `pirate-bluetooth library on`: `enabled = true` under `[local]` in `mopidy.conf` (old file kept as `mopidy.conf.before-library-on`) | left on (it's part of Pimoroni's setup) |
+| **Not changed** | Mopidy and its config (unless you run `library on`), default sound output, other sound cards, Wi-Fi, already-installed packages | |
 
 ## Credits
 

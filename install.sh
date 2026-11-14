@@ -194,6 +194,27 @@ if systemctl --user cat mopidy >/dev/null 2>&1; then
     MOPIDY_PORT="$(awk -F'=' '/^\[/{s=($0=="[http]")} s && $1 ~ /^[[:space:]]*port[[:space:]]*$/ {gsub(/[[:space:]]/,"",$2); print $2}' \
         "$HOME/.config/mopidy/mopidy.conf" 2>/dev/null | tail -n1)"
     MOPIDY_PORT="${MOPIDY_PORT:-6680}"
+    # Pimoroni's installer freezes Mopidy's settings at install time; if Mopidy-Local had a hiccup then,
+    # it stays switched off and uploaded songs never reach Mopidy's library.
+    MOPIDY_EXEC="$(systemctl --user cat mopidy 2>/dev/null | sed -n 's/^ExecStart=//p' | tail -n1)"
+    if python3 - "$MOPIDY_EXEC" "$HOME" 2>/dev/null <<'PY'
+import configparser, os, shlex, sys
+argv = shlex.split(sys.argv[1]) if sys.argv[1] else []
+files = []
+for i, arg in enumerate(argv):
+    if arg == "--config" and i + 1 < len(argv):
+        files += argv[i + 1].split(":")
+    elif arg.startswith("--config="):
+        files += arg.split("=", 1)[1].split(":")
+files = [os.path.expanduser(f) for f in files if f] or [os.path.join(sys.argv[2], ".config/mopidy/mopidy.conf")]
+cfg = configparser.RawConfigParser(inline_comment_prefixes=(";",), strict=False)
+cfg.read(files)
+sys.exit(0 if cfg.get("local", "enabled", fallback="true").strip().lower() in ("false", "no", "off", "0") else 1)
+PY
+    then
+        NOTES+=("Mopidy's music library (Mopidy-Local) is switched off in Mopidy's own settings, so songs you upload
+      only show in Iris under Browse > Files. After installing, 'pirate-bluetooth library on' switches it back on.")
+    fi
     if command -v curl >/dev/null && systemctl --user is-active mopidy >/dev/null 2>&1 && ! curl -s -m 3 -H 'Content-Type: application/json' \
             -d '{"jsonrpc":"2.0","id":1,"method":"core.get_version"}' "http://127.0.0.1:$MOPIDY_PORT/mopidy/rpc" \
             | grep -q '"result"'; then
@@ -458,7 +479,7 @@ if $UPLOAD; then
     echo "Add music from your PC or phone: open http://$(hostname).local:$UPLOAD_PORT"
     [ -n "$PI_IP" ] && echo "  (or http://$PI_IP:$UPLOAD_PORT) and drag songs or whole album folders onto the page."
 fi
-echo "Useful:  pirate-bluetooth (status)   journalctl --user -u pirate-bluetooth -f   bash uninstall.sh"
+echo "Useful:  pirate-bluetooth (status)   pirate-bluetooth logs -f   bash uninstall.sh"
 if $REBOOT_NEEDED; then
     echo
     warning "A reboot is needed to finish (hardware settings or group changes)."
