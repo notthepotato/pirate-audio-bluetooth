@@ -1,8 +1,10 @@
 """Small wrappers around system tools: ALSA volume (amixer), Mopidy hand-off (systemctl --user)."""
 
+import glob
 import json
 import logging
 import os
+import sys
 import re
 import socket
 import subprocess
@@ -33,6 +35,45 @@ def find_pirate_card(cards_file="/proc/asound/cards") -> Optional[str]:
     except OSError:
         pass
     return None
+
+
+def _card_index(card, cards_file="/proc/asound/cards"):
+    try:
+        with open(cards_file, encoding="utf-8") as fh:
+            for line in fh:
+                m = re.match(r"\s*(\d+)\s+\[([^\]]+)\]", line)
+                if m and m.group(2).strip() == card:
+                    return int(m.group(1))
+    except OSError:
+        pass
+    return None
+
+
+def dac_in_use(card=None, asound_dir="/proc/asound") -> bool:
+    """Is something (Mopidy, or Bluetooth audio) playing through the Pirate Audio's DAC right now?
+
+    The DAC can only be opened by one program at a time; a paused Mopidy keeps it open too."""
+    card = card or find_pirate_card()
+    index = _card_index(card, os.path.join(asound_dir, "cards")) if card else None
+    if index is None:
+        return False
+    for status in glob.glob(os.path.join(asound_dir, f"card{index}", "pcm*p", "sub*", "status")):
+        try:
+            with open(status, encoding="utf-8") as fh:
+                if fh.read().strip() != "closed":
+                    return True
+        except OSError:
+            pass
+    return False
+
+
+def wait_dac_free(timeout=4.0, card=None) -> bool:
+    deadline = time.monotonic() + timeout
+    while dac_in_use(card):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+    return True
 
 
 class HeadphoneVolume:
@@ -188,6 +229,7 @@ class MopidyHandoff:
         self._stopped_it = False
         self._snapshot = None
         self._enabled = None
+        self.restoring = False  # putting a saved queue back right now (it plays muted for a moment)
         self._restore_thread = None
         self._lock = threading.Lock()  # one of take() / boot restore / queue saving at a time
         self._boot = boot_id()
@@ -264,6 +306,13 @@ class MopidyHandoff:
 
     def restore(self, snap, wait=True):
         """Blocking: wait for Mopidy to come back, then put the saved state back (paused, silently)."""
+        self.restoring = True
+        try:
+            self._restore(snap, wait)
+        finally:
+            self.restoring = False
+
+    def _restore(self, snap, wait):
         if wait and not self._wait_until_ready():
             log.warning("Mopidy didn't come back within %d s; not restoring its queue", self.ready_timeout)
             return
@@ -477,6 +526,21 @@ class MopidyHandoff:
         self._stopped_it = False
 
 
+def restart_mopidy_keeping_queue(rpc_url="http://127.0.0.1:6680/mopidy/rpc"):
+    """Restart the Mopidy user service (after a settings change) and put its queue back afterwards.
+
+    A restart empties Mopidy's queue; this saves it first and restores it paused at the same spot."""
+    res = _run(["systemctl", "--user", "is-active", "mopidy"], timeout=10)
+    if not res or res.stdout.strip() != "active":
+        return False  # not running: the new settings apply when it starts
+    handoff = MopidyHandoff(mode="on", rpc_url=rpc_url, ready_timeout=120)
+    snap = handoff.snapshot(quiet=True)
+    _run(["systemctl", "--user", "restart", "mopidy"], timeout=120)
+    if snap and snap.get("uris"):
+        handoff.restore(snap)
+    return True
+
+
 def shutting_down() -> bool:
     """Is the Pi shutting down or rebooting (or the user's session ending)? Then don't restart things."""
     for scope in (["--user"], []):
@@ -495,3 +559,8 @@ def local_ip() -> str:
         return "not connected"
     finally:
         s.close()
+
+
+if __name__ == "__main__" and len(sys.argv) >= 2 and sys.argv[1] == "restart-mopidy":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    restart_mopidy_keeping_queue(*(sys.argv[2:3]))

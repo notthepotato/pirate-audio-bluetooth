@@ -29,6 +29,8 @@ try:
     BILINEAR = Image.Resampling.BILINEAR
 except AttributeError:  # Pillow < 9.1
     BILINEAR = Image.BILINEAR
+ROW_SEL = (44, 74, 128)  # highlighted menu row
+MENU_ROWS = 6
 
 _FONT_DIRS = ["/usr/share/fonts/truetype/dejavu", "/usr/share/fonts/dejavu"]
 _CJK_FONTS = [
@@ -170,12 +172,27 @@ class Renderer:
         for r in (26, 38):  # "looking for you" waves to the right
             d.arc((cx + 2 - r, cy - r, cx + 2 + r, cy + r), start=-35, end=35, fill=color, width=4)
 
-    # -- album card (Bluetooth doesn't carry cover art) ---------------------------------
+    # -- album art: a real picture when there is one, else a colored card -----------------
     def _load_art(self, view: View):
-        key = (view.album or view.title, view.artist)
+        key = view.art or (view.album or view.title, view.artist)
         if key == self._art_key:
             return
         self._art_key = key
+        if view.art:
+            try:
+                with Image.open(view.art) as pic:
+                    pic.draft("RGB", (SIZE * 2, SIZE * 2))  # fast JPEG decoding on small Pis
+                    pic = pic.convert("RGB")
+                    side = min(pic.size)
+                    left, top = (pic.width - side) // 2, (pic.height - side) // 2
+                    img = pic.crop((left, top, left + side, top + side)).resize((SIZE, SIZE), BILINEAR)
+                avg = img.resize((1, 1), BILINEAR).getpixel((0, 0))
+                h, sat, _v = colorsys.rgb_to_hsv(*(c / 255 for c in avg))
+                r, g, b = colorsys.hsv_to_rgb(h, max(sat, 0.45), 0.95)
+                self._art_base, self._accent = img, (int(r * 255), int(g * 255), int(b * 255))
+                return
+            except Exception as err:  # a broken or half-downloaded picture: fall back to the card
+                log.info("Couldn't use album art %s: %s", view.art, err)
         seed = (view.album or view.title or "music") + view.artist
         accent = _accent_from_text(seed)
         dark = tuple(int(c * 0.28) for c in accent)
@@ -198,6 +215,8 @@ class Renderer:
             "confirm": self._confirm,
             "info": self._info,
             "handback": self._handback,
+            "menu": self._menu,
+            "pi_idle": self._pi_idle,
         }.get(view.kind, self._idle)(view)
         if view.overlay and view.kind != "handback":  # the hand-back screen shows its message inline
             frame = self._overlay(frame, view.overlay)
@@ -215,11 +234,17 @@ class Renderer:
         artist_font = self.fonts.get(16, text=view.artist)
         small = self.fonts.get(11)
 
+        marks = ("⇄ " if view.shuffle else "") + {"all": "↻", "one": "↻1"}.get(view.repeat, "")
+        mark_font = self.fonts.get(13, bold=True)
+        marks_w = _text_width(d, marks.strip(), mark_font) if marks.strip() else 0
         if view.choice and not view.playing:  # just switched on: A plays the phone, X the Pi's music
             self._legend(d, top_left="play", top_right="Pi music")
-        elif view.phone:
-            f = self.fonts.get(11, text=view.phone)
-            d.text((margin, 10), _ellipsize(d, view.phone, f, width), font=f, fill=SUBTLE)
+        elif view.badge or view.phone:
+            badge = view.badge or view.phone
+            f = self.fonts.get(11, text=badge)
+            d.text((margin, 10), _ellipsize(d, badge, f, width - marks_w - 8), font=f, fill=SUBTLE)
+        if marks_w:
+            d.text((SIZE - margin - marks_w, 8), marks.strip(), font=mark_font, fill=SUBTLE)
         title = _ellipsize(d, view.title or view.album or "Unknown track", title_font, width)
         d.text((margin, 158), title, font=title_font, fill=TEXT)
         if view.artist:
@@ -262,9 +287,12 @@ class Renderer:
                 self._centered(d, "or press A to reconnect", 197, hint, FAINT)
             else:
                 self._centered(d, "No phone paired yet:", 180, hint, FAINT)
-                self._centered(d, "hold A, then press X to pair", 197, hint, FAINT)
+                self._centered(d, "hold A, pick Pair a new phone" if view.source else "hold A, then press X to pair",
+                               197, hint, FAINT)
         if view.choice:
             self._legend(d, top_left="play", top_right="Pi music")
+        elif view.source:
+            self._legend(d, top_left="hold: menu")
         return frame
 
     def _connected(self, view: View) -> Image.Image:
@@ -278,6 +306,79 @@ class Renderer:
         self._centered(d, "Press A, or play on your phone", 190, self.fonts.get(12), FAINT)
         if view.choice:
             self._legend(d, top_left="play", top_right="Pi music")
+        elif view.source:
+            self._legend(d, top_left="hold: menu")
+        return frame
+
+    def _pi_idle(self, view: View) -> Image.Image:
+        frame = _vertical_gradient((40, 30, 52), BG)
+        d = ImageDraw.Draw(frame)
+        cx, cy, col = 120, 62, (200, 160, 255)
+        d.ellipse((cx - 26, cy + 10, cx + 2, cy + 34), fill=col)  # a music note
+        d.rectangle((cx - 4, cy - 34, cx + 2, cy + 24), fill=col)
+        d.polygon([(cx + 2, cy - 34), (cx + 30, cy - 22), (cx + 30, cy - 8), (cx + 2, cy - 20)], fill=col)
+        self._centered(d, "Pi music", 106, self.fonts.get(14), SUBTLE)
+        f = self.fonts.get(20, bold=True, text=view.title)
+        self._centered(d, _ellipsize(d, view.title or "Nothing queued", f, 224), 128, f, TEXT)
+        hint = self.fonts.get(12)
+        self._centered(d, "Hold A to pick music,", 178, hint, FAINT)
+        self._centered(d, "or add some in Iris", 195, hint, FAINT)
+        self._legend(d, top_left="hold: menu")
+        return frame
+
+    def _menu(self, view: View) -> Image.Image:
+        frame = Image.new("RGB", (SIZE, SIZE), BG)
+        d = ImageDraw.Draw(frame)
+        rows = view.menu or []
+        sel = rows[view.menu_cursor] if 0 <= view.menu_cursor < len(rows) else None
+        verb = {"dir": "open", "track": "play", "queued": "play", "action": "select"}.get(
+            sel["kind"] if sel else "", "")
+        legend = self.fonts.get(11, bold=True)
+        if verb:
+            d.text((8, 6), f"A  {verb}", font=legend, fill=KEY)
+        t = "up  X"
+        d.text((SIZE - 8 - _text_width(d, t, legend), 6), t, font=legend, fill=KEY)
+        d.text((8, SIZE - 18), "B  back", font=legend, fill=KEY)
+        t = "down  Y"
+        d.text((SIZE - 8 - _text_width(d, t, legend), SIZE - 18), t, font=legend, fill=KEY)
+
+        title_font = self.fonts.get(16, bold=True, text=view.title)
+        count = f"{view.menu_offset + view.menu_cursor + 1}/{view.menu_total}" if view.menu_total > MENU_ROWS else ""
+        small = self.fonts.get(11)
+        count_w = _text_width(d, count, small) if count else 0
+        d.text((12, 24), _ellipsize(d, view.title, title_font, 216 - count_w - 8), font=title_font, fill=TEXT)
+        if count:
+            d.text((228 - count_w, 28), count, font=small, fill=FAINT)
+
+        top, row_h = 50, 28
+        if not rows:
+            note = view.menu_note or "Nothing here yet"
+            for i, line in enumerate(_wrap(d, note, self.fonts.get(13), 200, max_lines=4)):
+                self._centered(d, line, top + 40 + 18 * i, self.fonts.get(13), FAINT)
+            return frame
+        for i, row in enumerate(rows):
+            y = top + i * row_h
+            chosen = i == view.menu_cursor
+            if chosen:
+                d.rounded_rectangle((6, y + 1, 226, y + row_h - 2), radius=7, fill=ROW_SEL)
+            x, right = 14, 220
+            label = row["label"]
+            font = self.fonts.get(15, bold=chosen, text=label)
+            if row.get("current"):
+                d.text((x, y + 5), "♪", font=self.fonts.get(15, bold=True), fill=GREEN)
+                x += 16
+            value = row.get("value") or ("›" if row["kind"] == "dir" else "")
+            if value:
+                vf = self.fonts.get(13, bold=row["kind"] != "dir")
+                vw = _text_width(d, value, vf)
+                d.text((right - vw, y + 6), value, font=vf, fill=KEY if row["kind"] == "action" else FAINT)
+                right -= vw + 8
+            d.text((x, y + 5), _ellipsize(d, label, font, right - x), font=font, fill=TEXT if chosen else SUBTLE)
+        if view.menu_total > MENU_ROWS:  # scroll bar
+            span = MENU_ROWS * row_h
+            thumb = max(14, int(span * MENU_ROWS / view.menu_total))
+            pos = int((span - thumb) * view.menu_offset / max(1, view.menu_total - MENU_ROWS))
+            d.rounded_rectangle((231, top + pos, 234, top + pos + thumb), radius=2, fill=FAINT)
         return frame
 
     def _pairing(self, view: View) -> Image.Image:
@@ -341,7 +442,7 @@ class Renderer:
             pct = max(0, min(100, int(overlay[1])))
             d.rounded_rectangle((20, 86, 220, 152), radius=14, fill=(0, 0, 0, 200))
             f = self.fonts.get(13, bold=True)
-            d.text((36, 98), "Headphones", font=f, fill=TEXT)
+            d.text((36, 98), overlay[2] if len(overlay) > 2 else "Headphones", font=f, fill=TEXT)
             t = f"{pct}%"
             d.text((204 - _text_width(d, t, f), 98), t, font=f, fill=TEXT)
             d.rounded_rectangle((36, 124, 204, 134), radius=5, fill=(80, 84, 94, 255))

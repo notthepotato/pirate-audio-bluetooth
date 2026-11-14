@@ -32,7 +32,8 @@ success() { echo -e "$(c setaf 2)$1$(c sgr0)"; }
 
 NEW_PACKAGES="" DISABLED_UNITS="" GROUPS_ADDED="" CONFIG_TXT_ADDED=""
 CLASS_CHANGED="" CLASS_ORIG_LINE="" BT_ENABLED_BY_US="" RFKILL_UNBLOCKED="" ASOUND_CREATED=""
-LINGER_ENABLED_BY_US=""
+LINGER_ENABLED_BY_US="" MOPIDY_EXTS_DISABLED="" MOPIDY_CONF_FILE=""
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -f "$RECORD" ]; then
     # shellcheck disable=SC1090
     source "$RECORD"
@@ -46,6 +47,20 @@ systemctl --user disable --now pirate-bluetooth 2>/dev/null || true
 systemctl --user disable --now pirate-upload 2>/dev/null || true
 rm -f "$USER_UNIT" "$HOME/.config/systemd/user/pirate-upload.service"
 systemctl --user daemon-reload || true
+# Give Pimoroni's screen and buttons back to Mopidy, if the installer took them.
+if [ -n "$MOPIDY_EXTS_DISABLED" ] && [ -n "$MOPIDY_CONF_FILE" ] && [ -f "$MOPIDY_CONF_FILE" ]; then
+    inform "Switching Mopidy's own screen and buttons back on ($MOPIDY_EXTS_DISABLED )"
+    for ext in $MOPIDY_EXTS_DISABLED; do
+        PYTHONPATH="$SCRIPT_DIR" python3 -c 'import sys; from pirate_bluetooth import mopidyconf; mopidyconf.set_option(sys.argv[1], sys.argv[2], "enabled", "true")' \
+            "$MOPIDY_CONF_FILE" "$ext" || true
+    done
+    # The copy the installer kept is no longer needed if the file is back exactly as it was.
+    if cmp -s "$MOPIDY_CONF_FILE" "$MOPIDY_CONF_FILE.before-pirate-bluetooth"; then
+        rm -f "$MOPIDY_CONF_FILE.before-pirate-bluetooth"
+    fi
+    PYTHONPATH="$SCRIPT_DIR" python3 -m pirate_bluetooth.system restart-mopidy 2>/dev/null \
+        || systemctl --user restart mopidy 2>/dev/null || true
+fi
 # Belt and braces: if a Bluetooth session had Mopidy stopped, make sure it's running again.
 if [ -f "$STATE_DIR/mopidy-handoff.json" ] && systemctl --user is-enabled mopidy >/dev/null 2>&1; then
     systemctl --user start mopidy || true

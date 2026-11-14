@@ -111,8 +111,10 @@ def _callback(fn, *args):
 class GpioButtons:
     """Emits on_event(name, kind) from gpiozero's thread.
 
-    A and X: "short" on release, or "long" once when held.
-    B and Y: "press" immediately, then "repeat" while held (volume ramps).
+    A:    "short" on release, or "long" once when held.
+    X:    "press" at once, then "repeat" while held (menus scroll), plus "short" on a quick release or
+          "long" once when held (next / previous on the now-playing screen).
+    B, Y: "press" at once, then "repeat" while held (volume ramps, menus scroll).
     """
 
     def __init__(self, on_event, y_pin: int = 24, hold_time: float = 0.7, repeat_time: float = 0.25):
@@ -121,6 +123,8 @@ class GpioButtons:
         pins = {"A": 5, "B": 6, "X": 16, "Y": y_pin}
         self._buttons = []
         self._held = {}
+        self._pressed_at = {}
+        self._hold_time = hold_time
         try:
             for name, pin in pins.items():
                 if name in ("B", "Y"):
@@ -128,10 +132,17 @@ class GpioButtons:
                                hold_repeat=True)
                     b.when_pressed = _callback(on_event, name, "press")
                     b.when_held = _callback(on_event, name, "repeat")
+                elif name == "X":
+                    b = Button(pin, pull_up=True, bounce_time=0.03, hold_time=repeat_time,
+                               hold_repeat=True)
+                    self._held[name] = False
+                    b.when_pressed = _callback(self._pressed, name, on_event)
+                    b.when_held = _callback(self._repeat, name, on_event)
+                    b.when_released = _callback(self._released, name, on_event)
                 else:
                     b = Button(pin, pull_up=True, bounce_time=0.03, hold_time=hold_time)
                     self._held[name] = False
-                    b.when_pressed = _callback(self._pressed, name)
+                    b.when_pressed = _callback(self._pressed, name, None)
                     b.when_held = _callback(self._long, name, on_event)
                     b.when_released = _callback(self._released, name, on_event)
                 self._buttons.append(b)
@@ -139,8 +150,16 @@ class GpioButtons:
             self.close()
             raise
 
-    def _pressed(self, name):
+    def _pressed(self, name, on_event):
         self._held[name] = False
+        self._pressed_at[name] = time.monotonic()
+        if on_event:
+            on_event(name, "press")
+
+    def _repeat(self, name, on_event):
+        on_event(name, "repeat")
+        if not self._held[name] and time.monotonic() - self._pressed_at.get(name, 0) >= self._hold_time:
+            self._long(name, on_event)
 
     def _long(self, name, on_event):
         self._held[name] = True

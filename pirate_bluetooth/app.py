@@ -1,4 +1,13 @@
-"""Main loop: Bluetooth state in, frames to the LCD and button presses out."""
+"""Main loop: Bluetooth and Mopidy state in, frames to the LCD and button presses out.
+
+Two ways to share the Pirate Audio with Pimoroni's Mopidy setup:
+
+* One screen (the default since the add-on can browse music): Mopidy's own screen and button extensions
+  (PiDi, raspberry-gpio) are switched off, and this program runs the screen and buttons all the time, for
+  the phone (Bluetooth) and the Pi's own music (Mopidy, over its JSON-RPC API). Mopidy keeps running.
+* Hand-off (if PiDi or raspberry-gpio are still switched on): this program only borrows the screen and
+  buttons while the phone plays, by stopping Mopidy and starting it again afterwards.
+"""
 
 import argparse
 import configparser
@@ -10,18 +19,20 @@ import time
 
 from gi.repository import GLib
 
-from . import __version__
+from . import __version__, mopidyconf
+from .art import ArtLoader
 from .bluetooth import BluetoothClient
+from .menu import Item, Menu, Page, scroll_step
 from .state import NowPlaying, format_time
 from .system import (HeadphoneVolume, MopidyHandoff, boot_id, local_ip, read_json, shutting_down,
-                     uptime, write_json)
+                     uptime, wait_dac_free, write_json)
 from .view import View
 
 log = logging.getLogger("pirate_bluetooth")
 
 DEFAULTS = {
     "bluetooth": {"name": "Pirate Audio", "pair_seconds": "180", "reconnect_on_start": "yes",
-                  "reconnect_seconds": "180", "boot_wait": "300",
+                  "reconnect_seconds": "180", "boot_wait": "300", "art_lookup": "yes",
                   "auto_pair_if_none": "yes", "handback_after": "60", "bus": "system"},
     "display": {"rotation": "90", "spi_mhz": "80", "sleep_after": "120"},
     "buttons": {"y_pin": "24", "hold_time": "0.7"},
@@ -31,12 +42,15 @@ DEFAULTS = {
 }
 
 STATE_DIR = os.path.join(os.path.expanduser("~"), ".local", "state", "pirate-bluetooth")
+CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "pirate-bluetooth")
 TICK_MS = 500
 HW_RETRIES = 20
-MOPIDY_WATCH_S = 5  # how often Mopidy's queue/state is looked at while it has the screen
+MOPIDY_WATCH_S = 5  # how often Mopidy's queue is written down (so it survives reboots)
 FRESH_BOOT_S = 600  # started this soon after power-on (and first time this boot) = "just switched on"
 PRESS_RECONNECT_S = 30  # A pressed with no phone connected: keep trying this long
 PLAY_WAIT_S = 12  # ...and send Play if the phone shows up within this long after it connects
+DAC_WAIT_S = 4  # how long to wait for the phone's audio to let go of the sound card
+REPEAT_LABELS = {"off": "Off", "all": "All", "one": "One song"}
 
 
 def load_config(path):
@@ -52,6 +66,12 @@ class RecordRenderer:
 
     def render(self, view):
         return view
+
+
+def _repeat_mode(state):
+    if not state.get("repeat"):
+        return "off"
+    return "one" if state.get("single") else "all"
 
 
 class App:
@@ -70,8 +90,8 @@ class App:
         self.connecting = False  # looking for a paired phone right now
         self.bt_ready = False  # BlueZ has finished starting up (so self.paired is complete)
         self.play_pending_until = 0.0  # A was pressed before the phone was there: play when it is
-        # After power-on, if the phone was what played last, the Bluetooth screen keeps the buttons for
-        # a while (instead of Mopidy), so that A plays the phone. Ended by boot_wait, X, or events below.
+        # Hand-off mode only: after power-on, if the phone was what played last, the Bluetooth screen
+        # keeps the buttons for a while (instead of Mopidy), so that A plays the phone.
         self.boot_hold_until = 0.0
         self.boot_saw_connecting = False
         self.boot_saw_phone = False
@@ -107,13 +127,46 @@ class App:
         if self.mopidy.recover():
             self.mopidy.give_back()  # a previous run stopped Mopidy and didn't get to restart it
 
+        # One screen for both, or hand-off? (see the module docstring)
+        self.pi = None  # MopidyRemote when the Pi's own music is controlled from here
+        self.pi_state = {}
+        self.unified = True
+        mopidy_files = mopidyconf.config_files() if self.mopidy.enabled else []
+        if self.mopidy.enabled:
+            uses_screen = [ext for ext in ("pidi", "raspberry-gpio")
+                           if mopidyconf.extension_enabled(mopidy_files, ext) is not False]
+            if uses_screen:
+                self.unified = False
+                log.info("Mopidy still runs its own screen/buttons (%s): sharing them by hand-off",
+                         ", ".join(uses_screen))
+            else:
+                from .mopidy import MopidyRemote
+                self.pi = MopidyRemote(cfg.get("mopidy", "rpc_url"), self.on_pi_state, self.on_pi_error)
+                log.info("Running the screen and buttons for Bluetooth and the Pi's music")
+
+        self.menu = Menu()
+        self._swallow = None  # button whose press woke the screen
+        self._repeats = {}  # button -> how many repeat events while held (menus scroll faster)
+        music_dirs = [mopidyconf.get(mopidy_files, "local", "media_dir") or "~/Music"] if mopidy_files else ["~/Music"]
+        self.art = ArtLoader(os.path.join(CACHE_DIR, "art"), self.on_art,
+                             lookup_online=cfg.getboolean("bluetooth", "art_lookup"),
+                             music_dirs=[d.replace("$XDG_MUSIC_DIR", "~/Music") for d in music_dirs])
+        self.bt_art_key = None
+        self.pi_art_key = None
+        self.pi_track_uri = None
+
         self._last_used_file = os.path.join(STATE_DIR, "last-used.json")
         self.last_used = (read_json(self._last_used_file) or {}).get("source")
-        if (self._just_switched_on() and self.mopidy.enabled
+        self.source = "pi" if (self.pi and self.last_used == "mopidy") else "bluetooth"
+        if (not self.unified and self._just_switched_on()
                 and cfg.getboolean("bluetooth", "reconnect_on_start")
                 and self.last_used in ("phone", None)):  # None: nothing recorded yet (first run)
             log.info("Switched on, and the phone played last: the Bluetooth screen has the buttons for now")
             self.boot_hold_until = time.monotonic() + cfg.getfloat("bluetooth", "boot_wait")
+        elif self.unified:
+            self._just_switched_on()  # keep the marker current
+        if self.pi:
+            log.info("Playing from: %s (used last)", "the Pi's music" if self.source == "pi" else "Bluetooth")
 
         if args.record:
             self.renderer = RecordRenderer()
@@ -165,15 +218,15 @@ class App:
 
     def _watch_mopidy(self):
         """Worker thread: keeps Mopidy's saved queue current (and puts it back after power-on), and
-        notices when Mopidy is what's playing."""
+        notices when Mopidy is what's playing (hand-off mode)."""
         while not self._stop.wait(MOPIDY_WATCH_S):
             try:
-                if self.mopidy.watch_step() == "playing":
+                if self.mopidy.watch_step() == "playing" and not self.unified:
                     GLib.idle_add(self.set_last_used, "mopidy")
             except Exception:
                 log.exception("Watching Mopidy failed")
 
-    # == right after power-on ===========================================================
+    # == right after power-on (hand-off mode) ===========================================
     def boot_hold_active(self) -> bool:
         if not self.boot_hold_until:
             return False
@@ -202,8 +255,8 @@ class App:
 
     # == who owns the screen and buttons: us or Mopidy =============================
     def wants_hardware(self) -> bool:
-        if not self.mopidy.enabled:
-            return True  # no Mopidy to share with: always ours
+        if self.unified or not self.mopidy.enabled:
+            return True  # one screen for both, or no Mopidy to share with: always ours
         if self.pairing or self.confirm or time.monotonic() < self.hold_until:
             return True
         if self.boot_hold_active():
@@ -217,8 +270,9 @@ class App:
     def _update_ownership(self):
         want = self.wants_hardware()
         if want and not self.hw_owned and not self._taking:
-            if not self.mopidy.enabled:
-                self.acquire()
+            if self.unified or not self.mopidy.enabled:
+                if not self._acquire_source:
+                    self.acquire()
                 return
             self._taking = True
 
@@ -292,7 +346,7 @@ class App:
         if self.buttons:
             self.buttons.close()
         if self.display:
-            if self.mopidy.enabled and handback_screen:
+            if self.mopidy.enabled and not self.unified and handback_screen:
                 # Mopidy takes a few seconds to start; don't leave the old song frozen on screen.
                 try:
                     if self.asleep:
@@ -307,6 +361,93 @@ class App:
         self.info_until = 0.0
         self.play_pending_until = 0.0  # A pressed on our screen doesn't carry over to Mopidy's
         log.info("Display and buttons handed back")
+
+    # == switching between the phone and the Pi's music (one-screen mode) ================
+    def switch_to(self, target, play=True, started_elsewhere=False):
+        """Make `target` ("bluetooth" or "pi") the music that's on screen and on the buttons.
+
+        Only one of them can use the sound card at a time, so the other one is paused first: the phone
+        with a Bluetooth Pause, Mopidy by stopping it (a paused Mopidy keeps the sound card) and
+        remembering the spot, so it carries on from there later."""
+        if not self.pi:
+            return
+        changed = target != self.source
+        self.source = target
+        self.set_last_used("mopidy" if target == "pi" else "phone")
+        if changed:
+            log.info("Now playing from %s", "the Pi's music" if target == "pi" else "Bluetooth")
+            self.wake()
+        if target == "pi":
+            self.play_pending_until = 0.0
+            phone_playing = bool(self.phone and self.np.playing)
+            if phone_playing:
+                self.bt.command("pause")
+            if started_elsewhere:
+                if phone_playing:
+                    # Mopidy was started from Iris while the phone held the sound card, so it may not
+                    # have got it: once the phone lets go, make sure Mopidy is really playing.
+                    self.pi.run(self._pi_after_dac, self.pi.resume)
+            elif play:
+                self.pi.run(self._pi_after_dac, self.pi.resume, on_done=self._pi_resumed)
+            self.pi.fast = True
+            self.pi.poke()
+        else:
+            self.pi.fast = False
+            self.pi.run(self.pi.stop_and_remember)
+            if play:
+                if self.phone and self.has_player:
+                    self.bt.command("play", on_error=lambda _m: self.toast("Your phone didn't respond"))
+                else:
+                    self.play_pause()
+        self.request_render()
+
+    def _pi_after_dac(self, fn, *args):
+        """On the Mopidy worker: wait for the phone's audio to free the sound card, then run fn."""
+        if not wait_dac_free(DAC_WAIT_S, self.volume.card):
+            log.warning("The sound card is still busy; trying anyway")
+        return fn(*args)
+
+    def _pi_resumed(self, result):
+        if result == "empty":
+            self.toast("Nothing queued on the Pi. Hold A for the menu")
+
+    # == Mopidy (one-screen mode) =======================================================
+    def on_pi_state(self, state):
+        before = self.pi_state
+        self.pi_state = state
+        if not state.get("available"):
+            if before.get("available"):
+                log.warning("Mopidy stopped answering")
+            if self.source == "pi":
+                self.request_render()
+            return
+        playing = state.get("state") == "playing"
+        if not self.mopidy.restoring:
+            if playing and self.source != "pi":
+                log.info("Mopidy started playing (Iris?): switching to the Pi's music")
+                self.switch_to("pi", started_elsewhere=True)
+            elif state.get("state") == "paused" and self.source == "bluetooth":
+                # A paused Mopidy keeps the sound card open, which would block the phone's audio.
+                self.pi.run(self.pi.stop_and_remember)
+        if playing:
+            self.last_activity = time.monotonic()
+        track = state.get("track")
+        uri = track["uri"] if track else None
+        if uri != self.pi_track_uri:
+            self.pi_track_uri = uri
+            self.pi_art_key = self.art.for_mopidy(uri, lambda: self.pi.images(uri)) if uri else None
+            if self.source == "pi" and before.get("available"):
+                self.wake()
+        if self.menu.open and self.menu.stack[0].title == "Menu":
+            self._refresh_root()
+        self.request_render()
+
+    def on_pi_error(self, message):
+        self.toast(message if len(message) < 90 else "Mopidy didn't respond")
+
+    def on_art(self, key, path):
+        if key in (self.bt_art_key, self.pi_art_key):
+            self.request_render()
 
     # == Bluetooth events =============================================================
     def on_bt(self, changes):
@@ -330,7 +471,10 @@ class App:
             self.has_player = bool(changes["Player"])
         if "Track" in changes and self.np.apply_track(changes["Track"]):
             log.info("Now playing: %s - %s", self.np.artist, self.np.title)
+            self.bt_art_key = (self.art.for_phone(self.np.artist, self.np.album, self.np.title)
+                               if self.np.has_track else None)
             self.wake()
+        was_playing = self.np.playing
         if "Status" in changes:
             self.np.apply_status(changes["Status"], now)
             self.wake()
@@ -340,6 +484,8 @@ class App:
             self.last_playing_at = now
             self.play_pending_until = 0.0
             self.set_last_used("phone")
+            if self.pi and self.source != "bluetooth" and not was_playing:
+                self.switch_to("bluetooth", play=False)  # music started on the phone: it takes over
         if "Connecting" in changes:
             self.connecting = bool(changes["Connecting"])
             if self.connecting and self.boot_hold_until:
@@ -360,6 +506,8 @@ class App:
             # A was pressed while the phone was still connecting: now it can be told to play.
             self.play_pending_until = 0.0
             self.bt.command("play", on_error=lambda _m: self.toast("Your phone didn't respond"))
+        if self.menu.open and self.menu.stack[0].title == "Menu" and ("Device" in changes or "Paired" in changes):
+            self._refresh_root()
         self._update_ownership()
         self.request_render()
 
@@ -389,9 +537,20 @@ class App:
         log.debug("button %s %s", name, kind)
         if not self.hw_owned:
             return False
+        if kind == "press":
+            self._repeats[name] = 0
+        elif kind == "repeat":
+            self._repeats[name] = self._repeats.get(name, 0) + 1
         if self.asleep:
-            self.wake()  # the first press only wakes the screen
+            self.wake()  # the first press only wakes the screen...
+            # ...including the rest of that press (X's release, or B/Y/X held down)
+            self._swallow = name if kind == "press" else None
             return False
+        if self._swallow == name and kind != "press":
+            if kind == "short":
+                self._swallow = None
+            return False
+        self._swallow = None
         self.last_activity = time.monotonic()
         info_open = self.info_until > time.monotonic()
 
@@ -415,10 +574,15 @@ class App:
         elif self.pairing and name == "B" and kind == "press":
             self.bt.stop_pairing()
             self.toast("Pairing cancelled")
+        elif self.menu.open:
+            self.menu_button(name, kind)
         elif name == "A" and kind == "short":
             self.play_pause()
         elif name == "A" and kind == "long":
-            self.info_until = time.monotonic() + 10.0
+            if self.pi or self.unified:
+                self.open_menu()
+            else:
+                self.info_until = time.monotonic() + 10.0
         elif name == "X" and kind == "short" and self.boot_hold_until and not self.np.playing:
             self.end_boot_hold("Switching to the Pi's music…")
         elif name == "X" and kind in ("short", "long"):
@@ -431,6 +595,11 @@ class App:
 
     def play_pause(self):
         now = time.monotonic()
+        if self.pi and self.source == "pi":
+            if self.phone and self.np.playing:
+                self.bt.command("pause")
+            self.pi.run(self._pi_after_dac, self.pi.play_pause, on_done=self._pi_resumed)
+            return
         if self.phone and self.has_player:
             self.bt.command("playpause", on_error=lambda _m: self.toast("Your phone didn't respond"))
         elif self.phone:  # connected a moment ago; its media controls show up a second or two later
@@ -445,21 +614,201 @@ class App:
             else:
                 self.toast("Pick it in your phone's Bluetooth list")
         else:
-            self.toast("No phone paired yet: hold A, then press X")
+            self.toast("No phone paired yet: hold A, then pick Pair a new phone" if self.unified
+                       else "No phone paired yet: hold A, then press X")
 
     def skip(self, action):
+        if self.pi and self.source == "pi":
+            self.pi.run(self.pi.next if action == "next" else self.pi.previous)
+            return
         if not (self.phone and self.has_player):
             self.toast("Nothing is playing over Bluetooth")
             return
         self.bt.command(action, on_error=lambda _m: self.toast("Your phone didn't respond"))
 
     def change_volume(self, delta):
+        if self.pi and self.source == "pi" and not self.info_until > time.monotonic():
+            def shown(value):
+                self.show_overlay(("volume", value, "Pi volume"), 1.6)
+            self.pi.run(self.pi.change_volume, delta, on_done=shown)
+            return
         value = self.volume.change(delta)
         if value is None:
             self.toast("Volume control isn't ready yet")
             threading.Thread(target=self.volume.ensure_control, daemon=True).start()
             return
-        self.show_overlay(("volume", value), 1.6)
+        self.show_overlay(("volume", value, "Headphones"), 1.6)
+
+    # == the music menu ===============================================================
+    def _root_items(self):
+        items = []
+        if self.pi:
+            if self.source == "pi":
+                label = f"Switch to {self.phone or (self.paired[0] if self.paired else 'Bluetooth')}"
+                items.append(Item(label, "action", action="to_bt"))
+            else:
+                items.append(Item("Switch to Pi music", "action", action="to_pi"))
+            items += [
+                Item("Artists", "dir", load=("browse", "local:directory?type=artist")),
+                Item("Songs A–Z", "dir", load=("browse", "local:directory?type=track")),
+                Item("Playlists", "dir", load=("playlists",)),
+                Item("Folders", "dir", load=("folders",)),
+                Item("Queue", "dir", load=("queue",)),
+                Item("Repeat", "action", action="repeat", value=REPEAT_LABELS[_repeat_mode(self.pi_state)]),
+                Item("Shuffle", "action", action="shuffle", value="On" if self.pi_state.get("random") else "Off"),
+            ]
+        items += [Item("Pair a new phone", "action", action="pair"), Item("Info", "action", action="info")]
+        return items
+
+    def open_menu(self):
+        root = Page("Menu")
+        root.set_items(self._root_items())
+        self.menu.show(root)
+        if self.pi:
+            self.pi.fast = True
+            self.pi.poke()
+        self.request_render()
+
+    def _refresh_root(self):
+        root = self.menu.stack[0]
+        root.set_items(self._root_items(), cursor=root.cursor)
+
+    def menu_button(self, name, kind):
+        page = self.menu.page
+        if name == "X" and kind in ("press", "repeat"):
+            page.move(-scroll_step(self._repeats.get("X", 0)) if kind == "repeat" else -1)
+        elif name == "Y" and kind in ("press", "repeat"):
+            page.move(scroll_step(self._repeats.get("Y", 0)) if kind == "repeat" else 1)
+        elif name == "B" and kind == "press":
+            if not self.menu.back():
+                self.close_menu()
+        elif name == "A" and kind == "short":
+            self.menu_select(page.selected(), page)
+        elif name == "A" and kind == "long":
+            self.menu_add_to_queue(page.selected())
+
+    def close_menu(self):
+        self.menu.close()
+        if self.pi:
+            self.pi.fast = self.source == "pi"
+
+    def menu_select(self, item, page):
+        if item is None:
+            return
+        if item.kind == "dir":
+            self.open_page(Page(item.label, load=item.load or ("browse", item.uri)))
+        elif item.kind == "track":
+            tracks = [i for i in page.items if i.kind == "track"]
+            index = next(n for n, i in enumerate(tracks) if i is item)
+            self.play_from_pi(self.pi.play_tracks, [t.uri for t in tracks], index)
+        elif item.kind == "queued":
+            self.play_from_pi(self.pi.play_tlid, item.tlid)
+        elif item.action == "to_pi":
+            self.close_menu()
+            self.switch_to("pi")
+        elif item.action == "to_bt":
+            self.close_menu()
+            self.switch_to("bluetooth")
+        elif item.action == "repeat":
+            def done(mode):
+                item.value = REPEAT_LABELS[mode]
+                self.request_render()
+            self.pi.run(self.pi.cycle_repeat, on_done=done)
+        elif item.action == "shuffle":
+            def done(on):
+                item.value = "On" if on else "Off"
+                self.request_render()
+            self.pi.run(self.pi.toggle_shuffle, on_done=done)
+        elif item.action == "pair":
+            self.close_menu()
+            self.bt.start_pairing()
+        elif item.action == "info":
+            self.close_menu()
+            self.info_until = time.monotonic() + 10.0
+
+    def play_from_pi(self, fn, *args):
+        """Start the Pi's music from the menu: pause the phone, wait for the sound card, then play."""
+        self.close_menu()
+        self.switch_to("pi", play=False)
+        self.pi.run(self._pi_after_dac, fn, *args)
+
+    def menu_add_to_queue(self, item):
+        if item is None or item.kind not in ("track", "dir") or not self.pi:
+            return
+
+        def job():
+            if item.kind == "track":
+                uris = [item.uri]
+            else:
+                uris = [i.uri for i in self._load_items(item.load or ("browse", item.uri))[0] if i.kind == "track"]
+            return self.pi.add_tracks(uris) if uris else 0
+
+        def done(count):
+            self.toast("Added to the queue" if count == 1 else f"Added {count} songs to the queue" if count
+                       else "No songs in there to add")
+        self.pi.run(job, on_done=done)
+
+    def open_page(self, page):
+        page.loading = True
+        self.menu.push(page)
+
+        def done(result):
+            items, cursor = result
+            page.set_items(items, cursor)
+            if not items:
+                page.error = "Nothing here yet"
+            self.request_render()
+
+        def failed(message):
+            page.loading = False
+            page.error = message
+            self.request_render()
+
+        self.pi.run(self._load_items, page.load, on_done=done, on_error=failed)
+
+    def _load_items(self, load):
+        """On the Mopidy worker: (items, cursor) for a page."""
+        from .mopidy import MopidyError
+
+        kind = load[0]
+        if kind == "queue":
+            current, tl_tracks = self.pi.queue()
+            items, cursor = [], 0
+            for n, tl in enumerate(tl_tracks):
+                track = tl.get("track") or {}
+                artists = ", ".join(a.get("name", "") for a in track.get("artists") or [])
+                name = track.get("name") or track.get("uri", "").rsplit("/", 1)[-1]
+                items.append(Item(f"{name} · {artists}" if artists else name, "queued", uri=track.get("uri", ""),
+                                  tlid=tl["tlid"], current=tl["tlid"] == current))
+                if tl["tlid"] == current:
+                    cursor = n
+            return items, cursor
+        if kind == "playlists":
+            refs = self.pi.playlists()
+            return [Item(r.get("name", "?"), "dir", uri=r["uri"], load=("playlist", r["uri"])) for r in refs], 0
+        if kind == "playlist":
+            refs = self.pi.playlist_items(load[1])
+        elif kind == "folders":
+            roots = [r for r in self.pi.roots() if r.get("uri", "").startswith("file:")]
+            if not roots:
+                raise MopidyError("Mopidy's Files view is switched off")
+            refs = self.pi.browse(roots[0]["uri"]) if len(roots) == 1 else roots
+        else:
+            uri = load[1]
+            refs = self.pi.browse(uri)
+            if not refs and uri.startswith("local:"):
+                if not any(r.get("uri", "").startswith("local:") for r in self.pi.roots()):
+                    raise MopidyError("Mopidy's music library is off. On the Pi, run: pirate-bluetooth library on")
+        items = []
+        for r in refs:
+            name = r.get("name") or r.get("uri", "?").rsplit("/", 1)[-1]
+            if r.get("type") == "track":
+                items.append(Item(name, "track", uri=r["uri"]))
+            elif r.get("type") == "playlist":
+                items.append(Item(name, "dir", uri=r["uri"], load=("playlist", r["uri"])))
+            else:
+                items.append(Item(name, "dir", uri=r["uri"], load=("browse", r["uri"])))
+        return items, 0
 
     # == overlays / sleep ===================================================================
     def show_overlay(self, overlay, seconds):
@@ -470,14 +819,19 @@ class App:
     def toast(self, text):
         log.info("toast: %s", text)
         self.show_overlay(("toast", text), 2.8)
+        return False
 
     def wake(self):
         self.last_activity = time.monotonic()
         if self.asleep:
             self.asleep = False
+            log.info("Screen on")
             if self.display:
                 self.display.backlight(True)
         self.request_render()
+
+    def music_playing(self) -> bool:
+        return bool(self.np.playing or (self.pi_state.get("state") == "playing"))
 
     def _tick(self):
         now = time.monotonic()
@@ -497,14 +851,19 @@ class App:
         if self.np.playing:
             self.last_playing_at = now
             dirty = dirty or self.np.progress is not None
+        if self.source == "pi" and self.pi_state.get("state") == "playing":
+            dirty = True  # progress bar
         if self.pairing:
             dirty = True  # countdown
+        if self.pi:  # look at Mopidy often only while its music is (or its menu is) on a lit screen
+            self.pi.fast = (self.source == "pi" or self.menu.open) and not self.asleep
         # Stay lit while waiting for the first press after power-on: a press on a dark screen only wakes it.
-        busy = self.np.playing or self.pairing or self.confirm or self.boot_hold_until
+        busy = self.music_playing() or self.pairing or self.confirm or self.boot_hold_until
         if (self.hw_owned and not self.asleep and self.sleep_after > 0 and not busy
                 and now - self.last_activity > self.sleep_after):
             log.info("Screen off (idle)")
             self.asleep = True
+            self.menu.close()
             self.display.backlight(False)
         self._update_ownership()
         if dirty:
@@ -525,7 +884,8 @@ class App:
             last_phone=self.paired[0] if self.paired else "",
             overlay=self.overlay if (self.overlay and now < self.overlay_until) else None,
             connecting=self.connecting and not self.phone,
-            choice=bool(self.boot_hold_until) and bool(self.mopidy.enabled),
+            choice=bool(self.boot_hold_until) and bool(self.mopidy.enabled) and not self.unified,
+            source=self.source if self.unified else "",
         )
         if self.confirm:
             view.kind = "confirm"
@@ -547,10 +907,23 @@ class App:
             view.kind = "pairing"
             left = max(0, int(self.bt.pairing_until - now))
             view.countdown = format_time(left)
+        elif self.menu.open:
+            page = self.menu.page
+            view.kind = "menu"
+            view.title = page.title
+            view.menu = [{"label": i.label, "kind": i.kind, "value": i.value, "current": i.current}
+                         for i in page.visible()]
+            view.menu_cursor = page.cursor - page.offset
+            view.menu_offset, view.menu_total = page.offset, len(page.items)
+            view.menu_note = "Loading…" if page.loading else page.error
+        elif self.pi and self.source == "pi":
+            self._pi_view(view, now)
         elif self.phone and self.np.has_track:
             view.kind = "playing"
+            view.badge = self.phone
             view.title, view.artist, view.album = self.np.title, self.np.artist, self.np.album
             view.playing = self.np.playing
+            view.art = self.art.known(self.bt_art_key) or "" if self.bt_art_key else ""
             p = self.np.progress
             if p is not None and p.duration > 0:
                 pos = p.now(self.np.playing, now)
@@ -562,6 +935,32 @@ class App:
         else:
             view.kind = "idle"
         return view
+
+    def _pi_view(self, view, now):
+        st = self.pi_state
+        track = st.get("track")
+        if not st.get("available"):
+            view.kind, view.title = "pi_idle", "Waiting for Mopidy…"
+            return
+        if not track:
+            view.kind, view.title = "pi_idle", "Nothing queued"
+            return
+        view.kind = "playing"
+        view.badge = "Pi music"
+        view.title, view.artist, view.album = track["title"], track["artist"], track["album"]
+        view.playing = st.get("state") == "playing"
+        view.art = self.art.known(self.pi_art_key) or "" if self.pi_art_key else ""
+        view.repeat = _repeat_mode(st)
+        view.shuffle = bool(st.get("random"))
+        length = (track.get("length") or 0) / 1000
+        if length > 0:
+            pos = st.get("position", 0) / 1000 + ((now - st.get("at", now)) if view.playing else 0)
+            pos = max(0.0, min(pos, length))
+            view.progress = pos / length
+            view.elapsed_text = format_time(pos)
+            view.remaining_text = "-" + format_time(length - pos)
+        if st.get("state") == "stopped":
+            view.playing = False
 
     def _render(self):
         self._render_pending = False
@@ -578,6 +977,8 @@ class App:
         log.info("Shutting down")
         self._stop.set()
         self.bt.close()
+        if self.pi:
+            self.pi.close()
         stopping = shutting_down()
         if not self.mopidy.stopped_by_us:
             self.mopidy.save_now()  # so the queue is back after the next power-on

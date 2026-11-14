@@ -497,7 +497,7 @@ class BluetoothClient:
 
     # == playback commands ===================================================================
     def command(self, action, on_error=None) -> bool:
-        """action: "playpause" | "play" | "next" | "previous". Returns False if there's no player."""
+        """action: "playpause" | "play" | "pause" | "next" | "previous". Returns False if there's no player."""
         player = self._current_player(self.device_path)
         if not player:
             return False
@@ -505,7 +505,7 @@ class BluetoothClient:
             status = self.objects[player][IFACE_PLAYER].get("Status")
             method = "Pause" if status in PLAYING_STATES else "Play"
         else:
-            method = {"play": "Play", "next": "Next", "previous": "Previous"}[action]
+            method = {"play": "Play", "pause": "Pause", "next": "Next", "previous": "Previous"}[action]
         self._call(player, IFACE_PLAYER, method, on_error=on_error)
         return True
 

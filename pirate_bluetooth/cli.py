@@ -8,14 +8,14 @@ import argparse
 import configparser
 import os
 import re
-import shutil
 import socket
 import subprocess
 import sys
 
 from gi.repository import Gio, GLib
 
-from .system import MopidyHandoff
+from . import mopidyconf
+from .system import restart_mopidy_keeping_queue
 from .upload import _mopidy_execstart, mopidy_config_files, mopidy_library_enabled
 
 BLUEZ = "org.bluez"
@@ -136,32 +136,7 @@ def cmd_logs(args):
 # == Mopidy's music library (Mopidy-Local) ===================================================
 def switch_on_local(path):
     """Put 'enabled = true' in the [local] section of one Mopidy config file (backed up first)."""
-    backup = path + ".before-library-on"
-    if os.path.exists(path) and not os.path.exists(backup):
-        shutil.copy2(path, backup)
-    try:
-        with open(path, encoding="utf-8") as fh:
-            lines = fh.read().split("\n")
-    except FileNotFoundError:
-        lines = []
-    out, section, added = [], None, False
-    for line in lines:
-        m = re.match(r"\s*\[([^\]]+)\]", line)
-        if m:
-            section = m.group(1).strip()
-            out.append(line)
-            if section == "local" and not added:
-                out.append("enabled = true")
-                added = True
-            continue
-        if section == "local" and re.match(r"\s*enabled\s*=", line):
-            continue  # an old enabled = ... line in the same section
-        out.append(line)
-    if not added:  # a second [local] section would stop Mopidy from starting, so only add one if none
-        out += ["", "[local]", "enabled = true", ""]
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write("\n".join(out))
-    return backup
+    return mopidyconf.set_option(path, "local", "enabled", "true", backup_suffix=".before-library-on")
 
 
 def cmd_library(args):
@@ -188,12 +163,8 @@ def cmd_library(args):
     if running:
         cfg = configparser.ConfigParser()
         cfg.read(SETTINGS)
-        mopidy = MopidyHandoff(mode="on", rpc_url=cfg.get("mopidy", "rpc_url",
-                                                         fallback="http://127.0.0.1:6680/mopidy/rpc"))
-        snap = mopidy.snapshot(quiet=True)  # a restart empties Mopidy's queue; put it back afterwards
-        print("Restarting Mopidy…")
-        subprocess.run(["systemctl", "--user", "restart", "mopidy"])
-        mopidy.restore(snap)
+        print("Restarting Mopidy (its queue is put back afterwards)…")
+        restart_mopidy_keeping_queue(cfg.get("mopidy", "rpc_url", fallback="http://127.0.0.1:6680/mopidy/rpc"))
     else:
         print("Mopidy isn't running right now (Bluetooth may have it paused); the change applies when it starts.")
 
@@ -231,6 +202,15 @@ def cmd_status(bz, _args):
         print(f"{label} {name_of(dev)} ({state})")
     level = current_latency()
     print(f"{'Bluetooth delay:':<17}{level} ({LATENCY_LEVELS[level][2]})")
+    argv = _mopidy_execstart()
+    if argv:
+        files = mopidy_config_files(argv)
+        own = [e for e in ("pidi", "raspberry-gpio") if mopidyconf.extension_enabled(files, e) is not False]
+        print(f"{'Screen, buttons:':<17}" + ("Mopidy's own; the add-on borrows them while the phone plays" if own
+                                             else "the add-on, for the phone and the Pi's music (hold A: menu)"))
+        library = mopidy_library_enabled(files)
+        if library is False:
+            print(f"{'Music library:':<17}off (pirate-bluetooth library on)")
     for unit in ("pirate-bluealsa", "pirate-bluealsa-aplay"):
         res = subprocess.run(["systemctl", "is-active", unit], capture_output=True, text=True)
         print(f"{unit + ':':<23}{res.stdout.strip() or 'unknown'}")

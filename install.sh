@@ -7,6 +7,7 @@
 #   bash install.sh             install (asks before changing anything)
 #   bash install.sh --name "Kite's Pirate" --y-pin 20 -y
 #   bash install.sh --latency low    (less delay; see "pirate-bluetooth latency" to change it later)
+#   bash install.sh --keep-pimoroni-screen   (Mopidy keeps its own screen; no music menu on the device)
 #
 # Run it as your normal user (not with sudo). It asks for your password when it needs it.
 set -euo pipefail
@@ -31,6 +32,7 @@ Y_PIN=24
 UPLOAD=true
 UPLOAD_PORT=6681
 LATENCY=""  # empty: keep the current setting (or "normal" on a first install)
+KEEP_PIMORONI_SCREEN=false
 ASSUME_YES=false
 CHECK_ONLY=false
 REBOOT_NEEDED=false
@@ -53,6 +55,9 @@ Usage: bash install.sh [options]
   --no-upload      Don't install the music upload page.
   --latency LEVEL  How far the sound lags behind the phone: low (~0.1 s buffered on the Pi),
                    normal (~0.2 s, default) or safe (~0.5 s, BlueALSA's own default).
+  --keep-pimoroni-screen
+                   Leave Pimoroni's now-playing screen and buttons to Mopidy, and only borrow them while
+                   the phone plays (the add-on's older way; no music menu on the device).
   -y, --yes        Don't ask for confirmation.
   -h, --help       Show this help.
 EOF
@@ -68,6 +73,7 @@ while [ $# -gt 0 ]; do
         --no-upload) UPLOAD=false ;;
         --latency) shift; LATENCY="${1:-}" ;;
         --latency=*) LATENCY="${1#--latency=}" ;;
+        --keep-pimoroni-screen) KEEP_PIMORONI_SCREEN=true ;;
         -y|--yes) ASSUME_YES=true ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; fatal "Unknown option: $1" ;;
@@ -224,6 +230,36 @@ PY
 fi
 MOPIDY_PORT="${MOPIDY_PORT:-6680}"
 
+# One screen for both: Mopidy's own screen (PiDi) and button (raspberry-gpio) extensions get switched off
+# in its config, and the add-on runs the screen and buttons for the phone and the Pi's music.
+mopidy_conf() { PYTHONPATH="$SCRIPT_DIR" python3 -m pirate_bluetooth.mopidyconf "$@"; }
+SCREEN_EXTS_ON=()
+MOPIDY_CONF_FILE=""
+# What an earlier install switched off (so --keep-pimoroni-screen can switch it back on)
+PREV_EXTS="$( (MOPIDY_EXTS_DISABLED=""; source "$RECORD" 2>/dev/null; echo $MOPIDY_EXTS_DISABLED) )"
+PREV_CONF="$( (MOPIDY_CONF_FILE=""; source "$RECORD" 2>/dev/null; echo "$MOPIDY_CONF_FILE") )"
+GIVE_BACK_EXTS=false
+if $KEEP_PIMORONI_SCREEN && [ -n "$PREV_EXTS" ] && [ -f "$PREV_CONF" ]; then
+    GIVE_BACK_EXTS=true
+    CHANGES+=("switch Mopidy's own screen and buttons ($PREV_EXTS) back on in $PREV_CONF")
+fi
+if $MOPIDY && ! $KEEP_PIMORONI_SCREEN; then
+    MOPIDY_CONF_FILE="$(PYTHONPATH="$SCRIPT_DIR" python3 -c 'from pirate_bluetooth import mopidyconf; print(mopidyconf.config_files()[-1])' 2>/dev/null || true)"
+    if [ -n "$MOPIDY_CONF_FILE" ] && [ -f "$MOPIDY_CONF_FILE" ]; then
+        for ext in pidi raspberry-gpio; do
+            [ "$(mopidy_conf get "$ext" enabled 2>/dev/null | tr 'A-Z' 'a-z')" = "false" ] || SCREEN_EXTS_ON+=("$ext")
+        done
+        if [ ${#SCREEN_EXTS_ON[@]} -gt 0 ]; then
+            CHANGES+=("switch off Mopidy's own screen and button extensions (${SCREEN_EXTS_ON[*]}) in $MOPIDY_CONF_FILE,
+      so the add-on can run the screen and buttons for both the phone and the Pi's music (with a music menu).
+      Mopidy, Iris and your music stay. uninstall.sh switches them back on (or use --keep-pimoroni-screen)")
+        fi
+    else
+        NOTES+=("Couldn't find Mopidy's config file, so Mopidy keeps its own screen and buttons and the add-on
+      borrows them while the phone plays.")
+    fi
+fi
+
 # User services (Mopidy, and the screen program) normally start only when you log in. "Linger" starts
 # them at power-on instead, which Pimoroni suggests for Mopidy too; without it, pressing play and the
 # phone reconnecting by itself wouldn't work until someone logs in.
@@ -267,15 +303,18 @@ success "Pirate Audio Bluetooth add-on"
 echo "  Pi:            $MODEL ($CODENAME)"
 echo "  Name:          $NAME"
 echo "  Sound card:    $CARD"
-if $MOPIDY; then
-    echo "  Mopidy:        found - stays exactly as it is. While your phone plays, the add-on borrows the"
+if $MOPIDY && ! $KEEP_PIMORONI_SCREEN && [ -n "$MOPIDY_CONF_FILE" ] && [ -f "$MOPIDY_CONF_FILE" ]; then
+    echo "  Mopidy:        found - keeps running. The add-on runs the screen and buttons for both your phone"
+    echo "                 and the Pi's music, with a music menu (hold A)."
+elif $MOPIDY; then
+    echo "  Mopidy:        found - keeps its own screen. While your phone plays, the add-on borrows the"
     echo "                 screen and buttons, then gives them back with Mopidy's queue restored."
 else
     echo "  Mopidy:        not installed - the add-on keeps the screen and buttons."
 fi
 echo
-echo "Not changed: Mopidy and its settings, the default sound output, other sound cards, your Wi-Fi,"
-echo "             and anything already installed (no upgrades)."
+echo "Not changed: Mopidy's music, queue and other settings, the default sound output, other sound cards,"
+echo "             your Wi-Fi, and anything already installed (no upgrades)."
 echo
 echo "Will change:"
 for item in "${CHANGES[@]}"; do echo "  - $item"; done
@@ -440,6 +479,31 @@ for group in spi gpio audio; do
         REBOOT_NEEDED=true
     fi
 done
+if $GIVE_BACK_EXTS; then
+    inform "Giving Pimoroni's screen and buttons back to Mopidy"
+    for ext in $PREV_EXTS; do
+        PYTHONPATH="$SCRIPT_DIR" python3 -c 'import sys; from pirate_bluetooth import mopidyconf; mopidyconf.set_option(sys.argv[1], sys.argv[2], "enabled", "true")' \
+            "$PREV_CONF" "$ext"
+    done
+    if cmp -s "$PREV_CONF" "$PREV_CONF.before-pirate-bluetooth"; then rm -f "$PREV_CONF.before-pirate-bluetooth"; fi
+    record MOPIDY_EXTS_DISABLED ""
+    systemctl --user stop pirate-bluetooth 2>/dev/null || true
+    PYTHONPATH="$SCRIPT_DIR" python3 -m pirate_bluetooth.system restart-mopidy \
+        "http://127.0.0.1:$MOPIDY_PORT/mopidy/rpc" || systemctl --user restart mopidy || true
+fi
+if [ ${#SCREEN_EXTS_ON[@]} -gt 0 ]; then
+    inform "Handing Pimoroni's screen and buttons to the add-on"
+    for ext in "${SCREEN_EXTS_ON[@]}"; do
+        mopidy_conf set "$ext" enabled false >/dev/null
+        record_add MOPIDY_EXTS_DISABLED "$ext"
+    done
+    record MOPIDY_CONF_FILE "$MOPIDY_CONF_FILE"
+    # Stop the screen program first (it may have Mopidy paused), then restart Mopidy without them,
+    # keeping its queue.
+    systemctl --user stop pirate-bluetooth 2>/dev/null || true
+    PYTHONPATH="$SCRIPT_DIR" python3 -m pirate_bluetooth.system restart-mopidy \
+        "http://127.0.0.1:$MOPIDY_PORT/mopidy/rpc" || systemctl --user restart mopidy || true
+fi
 systemctl --user daemon-reload
 systemctl --user enable pirate-bluetooth
 if [ "$LINGER_ACTION" = "enable" ]; then
@@ -464,7 +528,7 @@ echo
 success "All done!"
 echo
 echo "Pair your iPhone (first time only):"
-echo "  1. The Pirate Audio screen shows 'Pairing mode' (if not: hold A, then press X - or run: pirate-bluetooth pair)."
+echo "  1. The Pirate Audio screen shows 'Pairing mode' (if not: hold A and pick 'Pair a new phone' - or run: pirate-bluetooth pair)."
 echo "  2. On the iPhone: Settings > Bluetooth, tap \"$NAME\"."
 echo "  3. When both screens show the same 6-digit code, press A on the Pirate Audio and tap Pair on the iPhone."
 echo
@@ -472,7 +536,12 @@ echo "After that it works like headphones: it connects to your iPhone by itself 
 echo "(or pick \"$NAME\" in Control Center), and plays anything, including songs downloaded for offline"
 echo "listening. Right after power-on, A plays whatever you used last: your phone or the Pi's own music."
 echo
-echo "Buttons while your phone plays:  A play/pause (hold: info)   X next (hold: previous)   B/Y volume"
+if $MOPIDY && [ "$(mopidy_conf get pidi enabled 2>/dev/null | tr 'A-Z' 'a-z')" = "false" ]; then
+    echo "Buttons:  A play/pause (hold: music menu)   X next (hold: previous)   B/Y volume"
+    echo "In the menu:  X/Y move   A open/play (hold: add to queue)   B back"
+else
+    echo "Buttons while your phone plays:  A play/pause (hold: info)   X next (hold: previous)   B/Y volume"
+fi
 if $UPLOAD; then
     PI_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
     echo

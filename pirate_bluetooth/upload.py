@@ -26,6 +26,8 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from . import mopidyconf
+
 log = logging.getLogger("pirate_upload")
 
 AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".flac", ".ogg", ".oga", ".opus", ".wav", ".aif", ".aiff",
@@ -225,39 +227,10 @@ class MusicStore:
 
 
 # ==== refreshing Mopidy's library ===================================================================
-def _mopidy_execstart():
-    """The Mopidy user service's command line, e.g. ['/home/pi/.virtualenvs/mopidy/bin/mopidy', '--config', 'a:b']."""
-    try:
-        res = subprocess.run(["systemctl", "--user", "cat", "mopidy"], capture_output=True, text=True,
-                             timeout=10)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    for line in res.stdout.splitlines():
-        line = line.strip()
-        if line.startswith("ExecStart=") and line != "ExecStart=":
-            argv = shlex.split(line[len("ExecStart="):])
-            if argv:
-                argv[0] = argv[0].lstrip("-@:+!")
-                return argv
-    return None
-
-
-def mopidy_scan_command(argv=None):
-    """Build 'mopidy --config <same files as the service> local scan' from the Mopidy user service."""
-    argv = argv or _mopidy_execstart()
-    return ["nice", "-n", "10", *argv, "local", "scan"] if argv else None
-
-
-def mopidy_config_files(argv=None):
-    """Mopidy's config files in the order the service loads them (later ones win)."""
-    argv = argv or _mopidy_execstart() or []
-    files = []
-    for i, arg in enumerate(argv):
-        if arg == "--config" and i + 1 < len(argv):
-            files += argv[i + 1].split(":")
-        elif arg.startswith("--config="):
-            files += arg.split("=", 1)[1].split(":")
-    return [os.path.expanduser(f) for f in files if f] or [os.path.expanduser("~/.config/mopidy/mopidy.conf")]
+# Mopidy's service command and config files (shared with the screen program and the CLI)
+_mopidy_execstart = mopidyconf.service_command
+mopidy_scan_command = mopidyconf.scan_command
+mopidy_config_files = mopidyconf.config_files
 
 
 def mopidy_library_enabled(files):
@@ -265,13 +238,7 @@ def mopidy_library_enabled(files):
 
     Pimoroni's installer saves Mopidy's settings as they were at install time into defaults.conf. If
     Mopidy-Local wasn't working at that exact moment, that file says "[local] enabled = false" for good."""
-    cfg = configparser.RawConfigParser(inline_comment_prefixes=(";",), strict=False)
-    try:
-        cfg.read(files, encoding="utf-8")
-    except (configparser.Error, UnicodeDecodeError):
-        return None
-    value = cfg.get("local", "enabled", fallback="true").strip().lower()
-    return value not in ("false", "no", "off", "0")
+    return mopidyconf.extension_enabled(files, "local")
 
 
 LIBRARY_OFF = ("Mopidy's music library (Mopidy-Local) is switched off in Mopidy's settings, so new songs only "
